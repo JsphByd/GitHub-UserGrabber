@@ -17,10 +17,13 @@ func main() {
 	var orgArray []string
 	var keywords []string
 
+	keywords = append(keywords, "Powered by Citizen")
+	keywords = append(keywords, "U.S Chamber of Commerce")
+
 	filePath := "C:\\Users\\JosephBoyd\\Documents\\GitHub-Scanner\\organizations.txt"
 
 	orgArray, _ = read_file_return_list(filePath)
-	keywords, _ = read_file_return_list(filePath)
+	//keywords, _ = read_file_return_list(filePath)
 
 	orgToMembersMap := make(map[string][]string)
 	for org := range orgArray {
@@ -28,15 +31,30 @@ func main() {
 		orgToMembersMap[index] = append(orgToMembersMap[index], "")
 	}
 
+	//clone new maps using the original one
 	orgToFollowersMap := maps.Clone(orgToMembersMap)
 	orgToFollowersMapFiltered := maps.Clone(orgToMembersMap)
 	orgToReposMap := maps.Clone(orgToMembersMap)
 
+	//populate the three maps
 	orgToReposMap = get_org_repositories(orgToReposMap, client)
 	orgToMembersMap, orgToFollowersMap = get_GitHub_Org_Members(orgToMembersMap, orgToFollowersMap, client)
 	orgToFollowersMapFiltered = filter_followers(orgToFollowersMapFiltered, orgToFollowersMap, keywords, client)
 
 	fmt.Println(orgToFollowersMapFiltered, orgToFollowersMapFiltered, orgToReposMap)
+
+	//print out all users found
+	var allUsersArray []string
+	var filteredUsersArray []string
+	for _, users := range orgToFollowersMap {
+		allUsersArray = append(allUsersArray, users...)
+	}
+	for _, users := range orgToFollowersMapFiltered {
+		filteredUsersArray = append(filteredUsersArray, users...)
+	}
+
+	print_files("Test-allUsers.txt", allUsersArray)
+	print_files("Test-filteredUsers.txt", filteredUsersArray)
 }
 
 func filter_followers(orgToFollowersMapFiltered map[string][]string, orgToFollowersMap map[string][]string, keywords []string, client *github.Client) map[string][]string {
@@ -48,17 +66,56 @@ func filter_followers(orgToFollowersMapFiltered map[string][]string, orgToFollow
 		for follower := range orgToFollowersMap[org] {
 			//get company and bio
 			follower_data, _, _ := client.Users.Get(ctx, followersArray[follower])
-			if follower_data.Bio != nil {
-				//search functionality here.
-			}
-			if follower_data.Company != nil {
-				if _, ok := orgToFollowersMap[*follower_data.Company]; ok {
-					orgToFollowersMapFiltered[org] = append(orgToFollowersMapFiltered[org], *follower_data.Login)
-				}
+			user := search_and_match(follower_data, keywords)
+			if user != "NO RESULTS" {
+				orgToFollowersMapFiltered[org] = append(orgToFollowersMapFiltered[org], user)
 			}
 		}
 	}
 	return orgToFollowersMapFiltered
+}
+
+func search_and_match(userData *github.User, keywords []string) string {
+	var lowerCompany string
+	var lowerBio string
+	if userData == nil || len(keywords) == 0 {
+		fmt.Println("EMPTY KEYWORD LIST")
+		return "NO RESULTS"
+	}
+
+	lowerKeywords := make([]string, 0, len(keywords))
+	for _, k := range keywords {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		k = strings.ReplaceAll(k, " ", "")
+		k = strings.ReplaceAll(k, ".", "")
+		lowerKeywords = append(lowerKeywords, strings.ToLower(k))
+	}
+
+	if userData.Company != nil {
+		lowerCompany = strings.ToLower(*userData.Company)
+		lowerCompany = strings.ReplaceAll(lowerCompany, " ", "")
+		lowerCompany = strings.ReplaceAll(lowerCompany, ".", "")
+	} else {
+		lowerCompany = ""
+	}
+
+	if userData.Bio != nil {
+		lowerBio = strings.ToLower(*userData.Bio)
+	} else {
+		lowerBio = ""
+	}
+	for keyword := range lowerKeywords {
+		if lowerKeywords[keyword] == lowerCompany {
+			fmt.Println("found match for", *userData.Company)
+			return *userData.Login
+		} else if lowerKeywords[keyword] == lowerBio {
+			fmt.Println("found match for", *userData.Bio) //WIP - need regex
+		}
+	}
+	return "NO RESULTS"
 }
 
 func get_org_repositories(orgToReposMap map[string][]string, client *github.Client) map[string][]string {
@@ -105,12 +162,30 @@ func read_file_return_list(path string) ([]string, error) { //get the orgs from 
 	return result, err
 }
 
-func print_files() { //will need to build some sort of struct to store data?
+func print_files(filename string, contentArray []string) { //will need to build some sort of struct to store data?
 	fmt.Println("Print out the files and data")
 	//all users
 	//organization members
 	//organization followers
-	//organization followers filtered
+	//organization followers filtered"
+
+	content := ""
+
+	for user := range contentArray {
+		content = content + contentArray[user] + "\n"
+	}
+
+	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write file: %v\n", err)
+		os.Exit(1)
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read file: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(string(data))
 }
 
 func filter_users() { //keywords hashmap, user
@@ -145,7 +220,6 @@ func get_GitHub_Org_Members(orgToMembersMap map[string][]string, orgToFollowersM
 		orgToMembersMap[org] = memberUsernames
 		orgToFollowersMap[org] = followerUsernames
 	}
-
 	return orgToMembersMap, orgToFollowersMap
 }
 
