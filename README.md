@@ -18,17 +18,22 @@ Create files containing newline delimited lists of organizations and keywords. S
 
 Default: scan without a PAT token. Limited to 60 requests per hour.
 ```
-github-scanner -o orgs.txt -k keywords.txt
+Github-Scanner -o orgs.txt -k keywords.txt
+```
+
+Activate all scanning options using:
+```
+Github-Scanner -o orgs.txt -k keywords.txt 
 ```
 
 Provide a GitHub PAT token to make 5,000 requests per hour. 
 ```
-github-scanner -o orgs.txt -k keywords.txt -t <PAT TOKEN> 
+Github-Scanner -o orgs.txt -k keywords.txt -t <PAT TOKEN> 
 ```
 
 Requests can be limited by page. The following example only fetches the first page of results of an organization's members/followers/repositories. This can be used to limit the number of requests to the API.
 ```
-github-scanner -o orgs.txt -k keywords.txt -p 1
+Github-Scanner -o orgs.txt -k keywords.txt -p 1
 ```
 
 # Args
