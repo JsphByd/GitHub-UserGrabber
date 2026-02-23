@@ -3,230 +3,479 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
-	"maps"
 	"os"
 	"strings"
 
 	"github.com/google/go-github/github"
+	"golang.org/x/oauth2"
 )
 
-func main() {
-	client := github.NewClient(nil)
+// ── ANSI colors ──────────────────────────────────────────────────────────────
 
-	var orgArray []string
-	var keywords []string
+const (
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorCyan   = "\033[36m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorRed    = "\033[31m"
+	colorBlue   = "\033[34m"
+)
 
-	keywords = append(keywords, "Powered by Citizen")
-	keywords = append(keywords, "U.S Chamber of Commerce")
+func header(s string) { fmt.Printf("\n%s%s=== %s ===%s\n", colorBold, colorCyan, s, colorReset) }
+func info(f string, a ...any) {
+	fmt.Printf("  %s"+f+"%s\n", append([]any{colorGreen}, append(a, colorReset)...)...)
+}
+func warn(f string, a ...any) {
+	fmt.Printf("  %s"+f+"%s\n", append([]any{colorYellow}, append(a, colorReset)...)...)
+}
+func bullet(f string, a ...any) { fmt.Printf("    • "+f+"\n", a...) }
 
-	filePath := "C:\\Users\\JosephBoyd\\Documents\\GitHub-Scanner\\organizations.txt"
+// ── Data structures ───────────────────────────────────────────────────────────
 
-	orgArray, _ = read_file_return_list(filePath)
-	//keywords, _ = read_file_return_list(filePath)
-
-	orgToMembersMap := make(map[string][]string)
-	for org := range orgArray {
-		index := orgArray[org]
-		orgToMembersMap[index] = append(orgToMembersMap[index], "")
-	}
-
-	//clone new maps using the original one
-	orgToFollowersMap := maps.Clone(orgToMembersMap)
-	orgToFollowersMapFiltered := maps.Clone(orgToMembersMap)
-	orgToReposMap := maps.Clone(orgToMembersMap)
-
-	//populate the three maps
-	orgToReposMap = get_org_repositories(orgToReposMap, client)
-	orgToMembersMap, orgToFollowersMap = get_GitHub_Org_Members(orgToMembersMap, orgToFollowersMap, client)
-	orgToFollowersMapFiltered = filter_followers(orgToFollowersMapFiltered, orgToFollowersMap, keywords, client)
-
-	fmt.Println(orgToFollowersMapFiltered, orgToFollowersMapFiltered, orgToReposMap)
-
-	//print out all users found
-	var allUsersArray []string
-	var filteredUsersArray []string
-	for _, users := range orgToFollowersMap {
-		allUsersArray = append(allUsersArray, users...)
-	}
-	for _, users := range orgToFollowersMapFiltered {
-		filteredUsersArray = append(filteredUsersArray, users...)
-	}
-
-	print_files("Test-allUsers.txt", allUsersArray)
-	print_files("Test-filteredUsers.txt", filteredUsersArray)
+type OrgData struct {
+	Members         []string
+	Followers       []string
+	Repos           []string
+	FilteredUsers   []string // members + keyword-matched followers
+	FollowerNetwork []string // followers-of-members and followers-of-followers
 }
 
-func filter_followers(orgToFollowersMapFiltered map[string][]string, orgToFollowersMap map[string][]string, keywords []string, client *github.Client) map[string][]string {
-	ctx := context.Background()
-	//var finds []string
+// ── Entry point ───────────────────────────────────────────────────────────────
 
-	for org := range orgToFollowersMap {
-		followersArray := orgToFollowersMap[org]
-		for follower := range orgToFollowersMap[org] {
-			//get company and bio
-			follower_data, _, _ := client.Users.Get(ctx, followersArray[follower])
-			user := search_and_match(follower_data, keywords)
-			if user != "NO RESULTS" {
-				orgToFollowersMapFiltered[org] = append(orgToFollowersMapFiltered[org], user)
+func main() {
+	orgsFile := flag.String("o", "", "Path to file containing GitHub organization names (one per line)")
+	kwFile := flag.String("k", "", "Path to file containing keywords to filter users (one per line)")
+	pat := flag.String("t", "", "GitHub Personal Access Token (required to avoid rate limiting)")
+	scanFofM := flag.Bool("fm", false, "Also scan followers of org members")
+	scanFofF := flag.Bool("ff", false, "Also scan followers of org followers")
+	maxPages := flag.Int("p", 0, "Max number of pages to fetch per API call (0 = unlimited)")
+	scanName := flag.String("n", "", "Filename to save results under")
+	flag.Parse()
+
+	var filenameAllUsers string
+	var filenameFilteredUsers string
+
+	if *orgsFile == "" || *kwFile == "" {
+		fmt.Fprintf(os.Stderr, "%sUsage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-p <max_pages>]%s\n", colorRed, colorReset)
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	orgs, err := readLines(*orgsFile)
+	fatalIf("reading orgs file", err)
+
+	keywords, err := readLines(*kwFile)
+	fatalIf("reading keywords file", err)
+
+	var client *github.Client
+	if *pat != "" {
+		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: *pat})
+		tc := oauth2.NewClient(context.Background(), ts)
+		client = github.NewClient(tc)
+		info("Authenticated with PAT — rate limit: 5,000 req/hour")
+	} else {
+		client = github.NewClient(nil)
+		warn("No PAT provided — using unauthenticated requests (60 req/hour). Use -t to authenticate.")
+	}
+	ctx := context.Background()
+
+	orgMap := make(map[string]*OrgData, len(orgs))
+	for _, o := range orgs {
+		orgMap[o] = &OrgData{}
+	}
+
+	// ── Fetch base data ───────────────────────────────────────────────────────
+
+	header("Scanning Organizations")
+	for _, org := range orgs {
+		info("Organization: %s%s%s", colorBold, org, colorGreen)
+
+		orgMap[org].Members = fetchOrgMembers(ctx, client, org, *maxPages)
+		orgMap[org].Followers = fetchFollowers(ctx, client, org, *maxPages)
+		orgMap[org].Repos = fetchOrgRepos(ctx, client, org, *maxPages)
+
+		bullet("Members  : %d", len(orgMap[org].Members))
+		bullet("Followers: %d", len(orgMap[org].Followers))
+		bullet("Repos    : %d", len(orgMap[org].Repos))
+	}
+
+	// ── Follower network (followers-of-members + followers-of-followers) ──────
+
+	header("Building Follower Network")
+	for _, org := range orgs {
+		if !*scanFofM && !*scanFofF {
+			info("Skipping extended network scan (use -fm and/or -ff to enable)")
+			break
+		}
+
+		seen := make(map[string]bool)
+		for _, u := range orgMap[org].Followers {
+			seen[u] = true
+		}
+		for _, u := range orgMap[org].Members {
+			seen[u] = true
+		}
+
+		var network []string
+
+		if *scanFofM {
+			for _, member := range orgMap[org].Members {
+				for _, u := range fetchFollowers(ctx, client, member, *maxPages) {
+					if !seen[u] {
+						seen[u] = true
+						network = append(network, u)
+					}
+				}
 			}
 		}
+
+		if *scanFofF {
+			for _, follower := range orgMap[org].Followers {
+				for _, u := range fetchFollowers(ctx, client, follower, *maxPages) {
+					if !seen[u] {
+						seen[u] = true
+						network = append(network, u)
+					}
+				}
+			}
+		}
+
+		orgMap[org].FollowerNetwork = network
+		info("Org %s%s%s — extended network: %d additional users", colorBold, org, colorGreen, len(network))
 	}
-	return orgToFollowersMapFiltered
+
+	// ── Keyword filtering ─────────────────────────────────────────────────────
+
+	header("Filtering Users by Keywords")
+	for _, org := range orgs {
+		var filtered []string
+
+		// All members are always included in the filtered output
+		filtered = append(filtered, orgMap[org].Members...)
+
+		// Filter direct followers
+		for _, u := range orgMap[org].Followers {
+			if matchesKeywords(ctx, client, u, keywords) {
+				filtered = append(filtered, u)
+			}
+		}
+
+		// Filter follower-network users
+		for _, u := range orgMap[org].FollowerNetwork {
+			if matchesKeywords(ctx, client, u, keywords) {
+				filtered = append(filtered, u)
+			}
+		}
+
+		orgMap[org].FilteredUsers = filtered
+		info("Org %s%s%s — %d filtered users", colorBold, org, colorGreen, len(filtered))
+	}
+
+	// ── Pretty terminal report ────────────────────────────────────────────────
+
+	printReport(orgs, orgMap)
+
+	// ── Write output files ────────────────────────────────────────────────────
+
+	header("Writing Output Files")
+
+	allUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
+		combined := d.Members
+		combined = append(combined, d.Followers...)
+		combined = append(combined, d.FollowerNetwork...)
+		return combined
+	}))
+
+	filteredUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
+		return d.FilteredUsers
+	}))
+
+
+	if *scanName == "" {
+		filenameFilteredUsers = "filtered_users.txt"
+		filenameAllUsers = "all_users.txt"
+	} else {
+		filenameFilteredUsers = *scanName + "-filtered_users.txt"
+		filenameAllUsers = *scanName + "-all_users.txt"
+	}
+
+	writeLines(filenameAllUsers, allUsers)
+	info("Wrote %d unique users → all_users.txt", len(allUsers))
+
+	writeLines(filenameFilteredUsers, filteredUsers)
+	info("Wrote %d unique filtered users → filtered_users.txt", len(filteredUsers))
 }
 
-func search_and_match(userData *github.User, keywords []string) string {
-	var lowerCompany string
-	var lowerBio string
-	if userData == nil || len(keywords) == 0 {
-		fmt.Println("EMPTY KEYWORD LIST")
-		return "NO RESULTS"
+// ── Terminal report ───────────────────────────────────────────────────────────
+
+func printReport(orgs []string, orgMap map[string]*OrgData) {
+	header("Full Report")
+
+	for _, org := range orgs {
+		d := orgMap[org]
+		fmt.Printf("\n%s%s%s %s[%s]%s\n", colorBold, colorCyan, org, colorBlue, "organization", colorReset)
+
+		fmt.Printf("  %s%-18s%s (%d)\n", colorBold, "Repositories", colorReset, len(d.Repos))
+		for _, r := range d.Repos {
+			bullet("%s", r)
+		}
+
+		fmt.Printf("  %s%-18s%s (%d)\n", colorBold, "Members", colorReset, len(d.Members))
+		for _, u := range d.Members {
+			bullet("%s", u)
+		}
+
+		fmt.Printf("  %s%-18s%s (%d)\n", colorBold, "Followers", colorReset, len(d.Followers))
+		for _, u := range d.Followers {
+			bullet("%s", u)
+		}
+
+		fmt.Printf("  %s%-18s%s (%d — see all_users.txt)\n", colorBold, "Extended Network", colorReset, len(d.FollowerNetwork))
+
+		// Only show extended-network users that made it into the filtered list
+		memberSet := make(map[string]bool, len(d.Members))
+		for _, u := range d.Members {
+			memberSet[u] = true
+		}
+		followerSet := make(map[string]bool, len(d.Followers))
+		for _, u := range d.Followers {
+			followerSet[u] = true
+		}
+		fmt.Printf("  %s%-18s%s (%d)\n", colorBold, "Filtered Users", colorReset, len(d.FilteredUsers))
+		for _, u := range d.FilteredUsers {
+			source := "member"
+			if !memberSet[u] && followerSet[u] {
+				source = "direct follower"
+			} else if !memberSet[u] && !followerSet[u] {
+				source = "extended network"
+			}
+			bullet("%s%s%s %s(%s)%s", colorGreen, u, colorReset, colorYellow, source, colorReset)
+		}
+	}
+}
+
+// ── GitHub helpers ────────────────────────────────────────────────────────────
+
+// ── Rate limit helpers ────────────────────────────────────────────────────────
+
+func checkRateLimit(resp *github.Response, label string) bool {
+	if resp == nil {
+		return false
+	}
+	rl := resp.Rate
+	if rl.Remaining == 0 {
+		fmt.Printf("\n%s%s⚠ RATE LIMIT REACHED%s — %s\n", colorBold, colorRed, colorReset, label)
+		fmt.Printf("  Limit    : %d\n", rl.Limit)
+		fmt.Printf("  Remaining: %s0%s\n", colorRed, colorReset)
+		fmt.Printf("  Resets at: %s\n\n", rl.Reset.Time.Local().Format("15:04:05 MST"))
+		return true
+	}
+	if rl.Remaining < 50 {
+		fmt.Printf("  %s⚠ Rate limit low%s — %d / %d remaining (resets %s)\n",
+			colorYellow, colorReset, rl.Remaining, rl.Limit,
+			rl.Reset.Time.Local().Format("15:04:05 MST"))
+	}
+	return false
+}
+
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := err.(*github.RateLimitError)
+	if ok {
+		return true
+	}
+	if strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "429") {
+		return true
+	}
+	return false
+}
+
+func handleAPIErr(label string, err error, resp *github.Response) bool {
+	if err == nil {
+		return false
+	}
+	if isRateLimitErr(err) {
+		reset := "unknown"
+		if resp != nil {
+			reset = resp.Rate.Reset.Time.Local().Format("15:04:05 MST")
+		}
+		fmt.Printf("\n%s%s⚠ THROTTLED / RATE LIMITED%s — %s\n", colorBold, colorRed, colorReset, label)
+		fmt.Printf("  GitHub has temporarily blocked requests. Resets at: %s\n\n", reset)
+	} else {
+		warn("API error (%s): %v", label, err)
+	}
+	return true
+}
+
+// ── GitHub helpers ────────────────────────────────────────────────────────────
+
+func fetchOrgMembers(ctx context.Context, client *github.Client, org string, maxPages int) []string {
+	opts := &github.ListMembersOptions{
+		PublicOnly:  true,
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var names []string
+	page := 0
+	for {
+		members, resp, err := client.Organizations.ListMembers(ctx, org, opts)
+		if handleAPIErr("ListMembers:"+org, err, resp) {
+			break
+		}
+		checkRateLimit(resp, "ListMembers:"+org)
+		for _, m := range members {
+			names = append(names, m.GetLogin())
+		}
+		page++
+		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return names
+}
+
+func fetchFollowers(ctx context.Context, client *github.Client, user string, maxPages int) []string {
+	opts := &github.ListOptions{PerPage: 100}
+	var names []string
+	page := 0
+	for {
+		followers, resp, err := client.Users.ListFollowers(ctx, user, opts)
+		if handleAPIErr("ListFollowers:"+user, err, resp) {
+			break
+		}
+		checkRateLimit(resp, "ListFollowers:"+user)
+		for _, f := range followers {
+			names = append(names, f.GetLogin())
+		}
+		page++
+		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return names
+}
+
+func fetchOrgRepos(ctx context.Context, client *github.Client, org string, maxPages int) []string {
+	opts := &github.RepositoryListByOrgOptions{
+		Type:        "all",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var names []string
+	page := 0
+	for {
+		repos, resp, err := client.Repositories.ListByOrg(ctx, org, opts)
+		if handleAPIErr("ListByOrg:"+org, err, resp) {
+			break
+		}
+		checkRateLimit(resp, "ListByOrg:"+org)
+		for _, r := range repos {
+			names = append(names, r.GetName())
+		}
+		page++
+		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return names
+}
+
+func matchesKeywords(ctx context.Context, client *github.Client, login string, keywords []string) bool {
+	u, resp, err := client.Users.Get(ctx, login)
+	if handleAPIErr("Users.Get:"+login, err, resp) {
+		return false
+	}
+	if u == nil {
+		return false
+	}
+	checkRateLimit(resp, "Users.Get:"+login)
+
+	normalize := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.ReplaceAll(s, " ", "")
+		s = strings.ReplaceAll(s, ".", "")
+		return s
 	}
 
-	lowerKeywords := make([]string, 0, len(keywords))
-	for _, k := range keywords {
-		k = strings.TrimSpace(k)
-		if k == "" {
+	company := normalize(u.GetCompany())
+	bio := normalize(u.GetBio())
+
+	for _, kw := range keywords {
+		kw = normalize(strings.TrimSpace(kw))
+		if kw == "" {
 			continue
 		}
-		k = strings.ReplaceAll(k, " ", "")
-		k = strings.ReplaceAll(k, ".", "")
-		lowerKeywords = append(lowerKeywords, strings.ToLower(k))
-	}
-
-	if userData.Company != nil {
-		lowerCompany = strings.ToLower(*userData.Company)
-		lowerCompany = strings.ReplaceAll(lowerCompany, " ", "")
-		lowerCompany = strings.ReplaceAll(lowerCompany, ".", "")
-	} else {
-		lowerCompany = ""
-	}
-
-	if userData.Bio != nil {
-		lowerBio = strings.ToLower(*userData.Bio)
-	} else {
-		lowerBio = ""
-	}
-	for keyword := range lowerKeywords {
-		if lowerKeywords[keyword] == lowerCompany {
-			fmt.Println("found match for", *userData.Company)
-			return *userData.Login
-		} else if lowerKeywords[keyword] == lowerBio {
-			fmt.Println("found match for", *userData.Bio) //WIP - need regex
+		if strings.Contains(company, kw) || strings.Contains(bio, kw) {
+			fmt.Printf("    %s✓ Match%s — %s (company: %q | bio: %q)\n",
+				colorGreen, colorReset, login, u.GetCompany(), u.GetBio())
+			return true
 		}
 	}
-	return "NO RESULTS"
+	return false
 }
 
-func get_org_repositories(orgToReposMap map[string][]string, client *github.Client) map[string][]string {
-	ctx := context.Background()
-	var repositories []*github.Repository
-	var repository_names []string
+// ── File I/O helpers ──────────────────────────────────────────────────────────
 
-	repoListOpts := &github.RepositoryListByOrgOptions{
-		// Type of repositories to list. Possible values are: all, public, private,
-		// forks, sources, member. Default is "all".
-		Type: "all",
-	}
-
-	for org := range orgToReposMap {
-		repositories, _, _ = client.Repositories.ListByOrg(ctx, org, repoListOpts)
-		for repo := range repositories {
-			repository_names = append(repository_names, *repositories[repo].Name)
-		}
-		orgToReposMap[org] = repository_names
-	}
-
-	return orgToReposMap
-}
-
-func read_file_return_list(path string) ([]string, error) { //get the orgs from a file. return a map of org:string[]
+func readLines(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var result []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if line := strings.TrimSpace(sc.Text()); line != "" {
+			lines = append(lines, line)
 		}
-		result = append(result, line)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return result, err
+	return lines, sc.Err()
 }
 
-func print_files(filename string, contentArray []string) { //will need to build some sort of struct to store data?
-	fmt.Println("Print out the files and data")
-	//all users
-	//organization members
-	//organization followers
-	//organization followers filtered"
+func writeLines(path string, lines []string) {
+	f, err := os.Create(path)
+	fatalIf("creating "+path, err)
+	defer f.Close()
 
-	content := ""
-
-	for user := range contentArray {
-		content = content + contentArray[user] + "\n"
+	w := bufio.NewWriter(f)
+	for _, l := range lines {
+		fmt.Fprintln(w, l)
 	}
+	fatalIf("flushing "+path, w.Flush())
+}
 
-	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write file: %v\n", err)
-		os.Exit(1)
+// ── Utility ───────────────────────────────────────────────────────────────────
+
+func dedupe(s []string) []string {
+	seen := make(map[string]bool, len(s))
+	out := make([]string, 0, len(s))
+	for _, v := range s {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
 	}
-	data, err := os.ReadFile(filename)
+	return out
+}
+
+func collectField(m map[string]*OrgData, fn func(*OrgData) []string) []string {
+	var out []string
+	for _, d := range m {
+		out = append(out, fn(d)...)
+	}
+	return out
+}
+
+func fatalIf(ctx string, err error) {
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%sFatal (%s): %v%s\n", colorRed, ctx, err, colorReset)
 		os.Exit(1)
 	}
-
-	fmt.Println(string(data))
-}
-
-func filter_users() { //keywords hashmap, user
-	fmt.Println("Check user for keywords in bio")
-}
-
-func get_GitHub_Org_Members(orgToMembersMap map[string][]string, orgToFollowersMap map[string][]string, client *github.Client) (map[string][]string, map[string][]string) { //organization or user
-	ctx := context.Background()
-	var members []*github.User
-	var followers []*github.User
-	var memberUsernames []string
-	var followerUsernames []string
-
-	opts := &github.ListMembersOptions{
-		PublicOnly:  true,
-		ListOptions: github.ListOptions{PerPage: 100},
-	}
-
-	opts1 := &github.ListOptions{
-		PerPage: 100,
-	}
-
-	for org := range orgToMembersMap {
-		members, _, _ = client.Organizations.ListMembers(ctx, org, opts) //members
-		followers, _, _ = client.Users.ListFollowers(ctx, org, opts1)    //followers
-		for user := range members {
-			memberUsernames = append(memberUsernames, *members[user].Login)
-		}
-		for user := range followers {
-			followerUsernames = append(followerUsernames, *followers[user].Login)
-		}
-		orgToMembersMap[org] = memberUsernames
-		orgToFollowersMap[org] = followerUsernames
-	}
-	return orgToMembersMap, orgToFollowersMap
-}
-
-func get_stats() { //organization or user
-	fmt.Println("get the number of followers from a user or organization")
-}
-
-func build_output() { //will need to build some sort of struct to store data?
-	fmt.Println("build output files")
 }
