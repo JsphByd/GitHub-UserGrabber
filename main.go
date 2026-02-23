@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
+	"io"
+	"slices"
 
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
@@ -62,8 +67,10 @@ func main() {
 	scanName := flag.String("n", "", "Filename to save results under")
 	flag.Parse()
 
-	var filenameAllUsers string
+	var filenameAllUsers      string
 	var filenameFilteredUsers string
+	var filenameNetworkUsers  string
+	var filenameAllUsersMeta  string
 
 	if *orgsFile == "" || *kwFile == "" {
 		fmt.Fprintf(os.Stderr, "%sUsage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-fc] [-fp] [-fi] [-fa] [-p <max_pages>] [-n <scan_name>]%s\n", colorRed, colorReset)
@@ -188,7 +195,7 @@ func main() {
 		for _, org := range orgs {
 			known := buildKnownSet(orgMap[org])
 			var projectUsers []string
-			users := fetchProjectUsers(ctx, client, org, *maxPages)
+			users := fetchProjectUsers(ctx, client, org, *pat, *maxPages)
 			for _, u := range users {
 				if !known[u] {
 					known[u] = true
@@ -280,11 +287,14 @@ func main() {
 	allUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
 		combined := d.Members
 		combined = append(combined, d.Followers...)
-		combined = append(combined, d.FollowerNetwork...)
 		combined = append(combined, d.CommitUsers...)
 		combined = append(combined, d.ProjectUsers...)
 		combined = append(combined, d.IssueUsers...)
 		return combined
+	}))
+
+	networkUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
+		return d.FollowerNetwork
 	}))
 
 	filteredUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
@@ -294,13 +304,23 @@ func main() {
 	if *scanName == "" {
 		filenameAllUsers      = "all_users.txt"
 		filenameFilteredUsers = "filtered_users.txt"
+		filenameNetworkUsers  = "network_users.txt"
+		filenameAllUsersMeta  = "all_users_meta.yaml"
 	} else {
 		filenameAllUsers      = *scanName + "-all_users.txt"
 		filenameFilteredUsers = *scanName + "-filtered_users.txt"
+		filenameNetworkUsers  = *scanName + "-network_users.txt"
+		filenameAllUsersMeta  = *scanName + "-all_users_meta.yaml"
 	}
 
 	writeLines(filenameAllUsers, allUsers)
 	info("Wrote %d unique users → %s", len(allUsers), filenameAllUsers)
+
+	writeUserMeta(filenameAllUsersMeta, orgs, orgMap)
+	info("Wrote user source metadata → %s", filenameAllUsersMeta)
+
+	writeLines(filenameNetworkUsers, networkUsers)
+	info("Wrote %d extended network users → %s", len(networkUsers), filenameNetworkUsers)
 
 	writeLines(filenameFilteredUsers, filteredUsers)
 	info("Wrote %d unique filtered users → %s", len(filteredUsers), filenameFilteredUsers)
@@ -330,7 +350,7 @@ func printReport(orgs []string, orgMap map[string]*OrgData) {
 			bullet("%s", u)
 		}
 
-		fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Extended Network", colorReset, len(d.FollowerNetwork), "all_users.txt")
+		fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Extended Network", colorReset, len(d.FollowerNetwork), "network_users.txt")
 
 		if len(d.CommitUsers) > 0 {
 			fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Commit History", colorReset, len(d.CommitUsers), "all_users.txt")
@@ -508,28 +528,57 @@ func buildKnownSet(d *OrgData) map[string]bool {
 	return known
 }
 
-func fetchProjectUsers(ctx context.Context, client *github.Client, org string, maxPages int) []string {
+// ── Projects (v1 classic + v2 GraphQL) ───────────────────────────────────────
+
+func fetchProjectUsers(ctx context.Context, client *github.Client, org, pat string, maxPages int) []string {
+	seen := make(map[string]bool)
+	var names []string
+
+	addUser := func(u string) {
+		if u != "" && !seen[u] {
+			seen[u] = true
+			names = append(names, u)
+		}
+	}
+
+	// ── Detect which project versions exist ───────────────────────────────────
+	hasV1 := fetchProjectUsersV1(ctx, client, org, maxPages, addUser)
+	hasV2 := fetchProjectUsersV2(ctx, pat, org, maxPages, addUser)
+
+	if !hasV1 && !hasV2 {
+		warn("No projects found for org %s (checked both v1 classic and v2)", org)
+	}
+
+	return names
+}
+
+// fetchProjectUsersV1 scans classic Projects (v1) via REST.
+// Returns true if any v1 projects were found.
+func fetchProjectUsersV1(ctx context.Context, client *github.Client, org string, maxPages int, addUser func(string)) bool {
 	projOpts := &github.ProjectListOptions{
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
-	seen := make(map[string]bool)
-	var names []string
+	found := false
 	page := 0
 	for {
 		projects, resp, err := client.Organizations.ListProjects(ctx, org, projOpts)
-		if handleAPIErr("ListProjects:"+org, err, resp) {
+		if err != nil {
+			// 404 or 410 means org has no v1 projects — not an error worth reporting
+			if resp != nil && (resp.StatusCode == 404 || resp.StatusCode == 410) {
+				break
+			}
+			handleAPIErr("ListProjectsV1:"+org, err, resp)
 			break
 		}
-		checkRateLimit(resp, "ListProjects:"+org)
+		checkRateLimit(resp, "ListProjectsV1:"+org)
+		if len(projects) > 0 {
+			found = true
+			info("Detected Projects v1 (classic) for org %s", org)
+		}
 		for _, proj := range projects {
-			// Project creator
 			if proj.Creator != nil {
-				if u := proj.Creator.GetLogin(); u != "" && !seen[u] {
-					seen[u] = true
-					names = append(names, u)
-				}
+				addUser(proj.Creator.GetLogin())
 			}
-			// Drill into columns → cards
 			colOpts := &github.ListOptions{PerPage: 100}
 			for {
 				cols, colResp, colErr := client.Projects.ListProjectColumns(ctx, proj.GetID(), colOpts)
@@ -538,9 +587,7 @@ func fetchProjectUsers(ctx context.Context, client *github.Client, org string, m
 				}
 				checkRateLimit(colResp, fmt.Sprintf("ListProjectColumns:%d", proj.GetID()))
 				for _, col := range cols {
-					cardOpts := &github.ProjectCardListOptions{
-						ListOptions: github.ListOptions{PerPage: 100},
-					}
+					cardOpts := &github.ProjectCardListOptions{ListOptions: github.ListOptions{PerPage: 100}}
 					for {
 						cards, cardResp, cardErr := client.Projects.ListProjectCards(ctx, col.GetID(), cardOpts)
 						if handleAPIErr(fmt.Sprintf("ListProjectCards:%d", col.GetID()), cardErr, cardResp) {
@@ -549,10 +596,7 @@ func fetchProjectUsers(ctx context.Context, client *github.Client, org string, m
 						checkRateLimit(cardResp, fmt.Sprintf("ListProjectCards:%d", col.GetID()))
 						for _, card := range cards {
 							if card.Creator != nil {
-								if u := card.Creator.GetLogin(); u != "" && !seen[u] {
-									seen[u] = true
-									names = append(names, u)
-								}
+								addUser(card.Creator.GetLogin())
 							}
 						}
 						if cardResp.NextPage == 0 {
@@ -573,7 +617,197 @@ func fetchProjectUsers(ctx context.Context, client *github.Client, org string, m
 		}
 		projOpts.Page = resp.NextPage
 	}
-	return names
+	return found
+}
+
+// fetchProjectUsersV2 scans Projects v2 via GraphQL.
+// Returns true if any v2 projects were found.
+func fetchProjectUsersV2(ctx context.Context, pat, org string, maxPages int, addUser func(string)) bool {
+	if pat == "" {
+		warn("Skipping Projects v2 scan — a PAT with 'read:project' scope is required (-t flag)")
+		return false
+	}
+
+	// GraphQL query: paginate through v2 projects, their items, and assignees
+	const query = `
+	query($org: String!, $projCursor: String, $itemCursor: String) {
+		organization(login: $org) {
+			projectsV2(first: 20, after: $projCursor) {
+				pageInfo { hasNextPage endCursor }
+				nodes {
+					title
+					creator { login }
+					items(first: 100, after: $itemCursor) {
+						pageInfo { hasNextPage endCursor }
+						nodes {
+							creator { login }
+							... on ProjectV2Item {
+								fieldValues(first: 10) {
+									nodes {
+										... on ProjectV2ItemFieldUserValue {
+											users(first: 10) {
+												nodes { login }
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	type pageInfo struct {
+		HasNextPage bool   `json:"hasNextPage"`
+		EndCursor   string `json:"endCursor"`
+	}
+	type userNode struct{ Login string `json:"login"` }
+	type userConn struct{ Nodes []userNode `json:"nodes"` }
+	type fieldValue struct{ Users userConn `json:"users"` }
+	type fieldValues struct{ Nodes []fieldValue `json:"nodes"` }
+	type itemNode struct {
+		Creator     *userNode   `json:"creator"`
+		FieldValues fieldValues `json:"fieldValues"`
+	}
+	type itemConn struct {
+		PageInfo pageInfo   `json:"pageInfo"`
+		Nodes    []itemNode `json:"nodes"`
+	}
+	type projectNode struct {
+		Title   string    `json:"title"`
+		Creator *userNode `json:"creator"`
+		Items   itemConn  `json:"items"`
+	}
+	type projectConn struct {
+		PageInfo pageInfo       `json:"pageInfo"`
+		Nodes    []*projectNode `json:"nodes"`
+	}
+	type orgData struct{ ProjectsV2 projectConn `json:"projectsV2"` }
+	type gqlData struct{ Organization orgData `json:"organization"` }
+	type gqlResp struct {
+		Data   gqlData `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+
+	doQuery := func(projCursor, itemCursor string) (*gqlResp, error) {
+		vars := map[string]any{"org": org}
+		if projCursor != "" {
+			vars["projCursor"] = projCursor
+		}
+		if itemCursor != "" {
+			vars["itemCursor"] = itemCursor
+		}
+		body, _ := json.Marshal(map[string]any{"query": query, "variables": vars})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+pat)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("rate limited (HTTP %d)", resp.StatusCode)
+		}
+
+		// Read and decode response
+		rawBody, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", readErr)
+		}
+
+		var result gqlResp
+		if err := json.Unmarshal(rawBody, &result); err != nil {
+			return nil, err
+		}
+		if len(result.Errors) > 0 {
+			return nil, fmt.Errorf("GraphQL error: %s", result.Errors[0].Message)
+		}
+		return &result, nil
+	}
+
+	found := false
+	projCursor := ""
+	projPage := 0
+
+	for {
+		result, err := doQuery(projCursor, "")
+		if err != nil {
+			warn("Projects v2 GraphQL query failed for %s: %v", org, err)
+			break
+		}
+
+		projects := result.Data.Organization.ProjectsV2
+		if len(projects.Nodes) > 0 && !found {
+			found = true
+			info("Detected Projects v2 for org %s", org)
+		}
+
+		for _, proj := range projects.Nodes {
+				if proj == nil {
+					warn("Projects v2: received null project node for org %s — check that your PAT has 'read:project' scope", org)
+					continue
+				}
+			if proj.Creator != nil {
+				addUser(proj.Creator.Login)
+			}
+
+			// Paginate items within each project
+			itemCursor := ""
+			for {
+				var itemResult *gqlResp
+				var itemErr error
+				if itemCursor == "" {
+					itemResult = result // reuse first page
+					// only on first iteration; after that query fresh
+				}
+				if itemCursor != "" {
+					itemResult, itemErr = doQuery(projCursor, itemCursor)
+					if itemErr != nil {
+						warn("Projects v2 item pagination failed: %v", itemErr)
+						break
+					}
+					// find matching project in new result
+					for _, p := range itemResult.Data.Organization.ProjectsV2.Nodes {
+						if p.Title == proj.Title {
+							proj.Items = p.Items
+							break
+						}
+					}
+				}
+				for _, item := range proj.Items.Nodes {
+					if item.Creator != nil {
+						addUser(item.Creator.Login)
+					}
+					for _, fv := range item.FieldValues.Nodes {
+						for _, u := range fv.Users.Nodes {
+							addUser(u.Login)
+						}
+					}
+				}
+				if !proj.Items.PageInfo.HasNextPage {
+					break
+				}
+				itemCursor = proj.Items.PageInfo.EndCursor
+			}
+		}
+
+		projPage++
+		if !projects.PageInfo.HasNextPage || (maxPages > 0 && projPage >= maxPages) {
+			break
+		}
+		projCursor = projects.PageInfo.EndCursor
+	}
+	return found
 }
 
 func fetchIssueUsers(ctx context.Context, client *github.Client, org, repo string, maxPages int) []string {
@@ -682,6 +916,57 @@ func matchesKeywords(ctx context.Context, client *github.Client, login string, k
 	return false
 }
 
+// ── YAML metadata writer ──────────────────────────────────────────────────────
+
+// writeUserMeta writes a YAML file mapping each user to the org(s) and
+// source(s) they were found in.
+func writeUserMeta(path string, orgs []string, orgMap map[string]*OrgData) {
+	// user → list of "org (source)" strings
+	type entry struct {
+		orgs []string
+	}
+	meta := make(map[string]*entry)
+
+	add := func(user, org, source string) {
+		if _, ok := meta[user]; !ok {
+			meta[user] = &entry{}
+		}
+		meta[user].orgs = append(meta[user].orgs, fmt.Sprintf("%s (%s)", org, source))
+	}
+
+	for _, org := range orgs {
+		d := orgMap[org]
+		for _, u := range d.Members       { add(u, org, "member") }
+		for _, u := range d.Followers     { add(u, org, "follower") }
+		for _, u := range d.CommitUsers   { add(u, org, "commit history") }
+		for _, u := range d.ProjectUsers  { add(u, org, "project") }
+		for _, u := range d.IssueUsers    { add(u, org, "issue") }
+	}
+
+	f, err := os.Create(path)
+	fatalIf("creating "+path, err)
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	fmt.Fprintln(w, "# User source metadata")
+	fmt.Fprintln(w, "# Format: username -> list of 'org (source)' entries")
+	fmt.Fprintln(w, "users:")
+
+	// sort for deterministic output
+	sorted := make([]string, 0, len(meta))
+	for u := range meta { sorted = append(sorted, u) }
+	slices.Sort(sorted)
+
+	for _, user := range sorted {
+		fmt.Fprintf(w, "  %s:\n", user)
+		for _, src := range meta[user].orgs {
+			fmt.Fprintf(w, "    - %q\n", src)
+		}
+	}
+
+	fatalIf("flushing "+path, w.Flush())
+}
+
 // ── File I/O helpers ──────────────────────────────────────────────────────────
 
 func readLines(path string) ([]string, error) {
@@ -694,9 +979,16 @@ func readLines(path string) ([]string, error) {
 	var lines []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		if line := strings.TrimSpace(sc.Text()); line != "" {
-			lines = append(lines, line)
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
 		}
+		// Strip full GitHub URLs down to just the org/user name
+		// e.g. "https://github.com/uschamber-t3" → "uschamber-t3"
+		line = strings.TrimPrefix(line, "https://github.com/")
+		line = strings.TrimPrefix(line, "http://github.com/")
+		line = strings.TrimRight(line, "/")
+		lines = append(lines, line)
 	}
 	return lines, sc.Err()
 }
