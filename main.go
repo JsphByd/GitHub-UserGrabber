@@ -39,18 +39,25 @@ type OrgData struct {
 	Members         []string
 	Followers       []string
 	Repos           []string
-	FilteredUsers   []string // members + keyword-matched followers
-	FollowerNetwork []string // followers-of-members and followers-of-followers
+	FilteredUsers   []string
+	FollowerNetwork []string
+	CommitUsers     []string // users found in repo commit history, not seen elsewhere
+	ProjectUsers    []string // users found in org projects, not seen elsewhere
+	IssueUsers      []string // users found in repo issues, not seen elsewhere
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
 	orgsFile := flag.String("o", "", "Path to file containing GitHub organization names (one per line)")
-	kwFile := flag.String("k", "", "Path to file containing keywords to filter users (one per line)")
-	pat := flag.String("t", "", "GitHub Personal Access Token (required to avoid rate limiting)")
-	scanFofM := flag.Bool("fm", false, "Also scan followers of org members")
-	scanFofF := flag.Bool("ff", false, "Also scan followers of org followers")
+	kwFile   := flag.String("k", "", "Path to file containing keywords to filter users (one per line)")
+	pat      := flag.String("t", "", "GitHub Personal Access Token (required to avoid rate limiting)")
+	scanFofM    := flag.Bool("fm", false, "Also scan followers of org members")
+	scanFofF    := flag.Bool("ff", false, "Also scan followers of org followers")
+	scanCommits  := flag.Bool("fc", false, "Also scan commit history of org repositories for contributors")
+	scanProjects := flag.Bool("fp", false, "Also scan org projects for new users")
+	scanIssues   := flag.Bool("fi", false, "Also scan repository issues for new users")
+	scanAll      := flag.Bool("fa", false, "Scan everything: members, followers, followers-of-members/followers, projects, commits, and issues")
 	maxPages := flag.Int("p", 0, "Max number of pages to fetch per API call (0 = unlimited)")
 	scanName := flag.String("n", "", "Filename to save results under")
 	flag.Parse()
@@ -59,7 +66,7 @@ func main() {
 	var filenameFilteredUsers string
 
 	if *orgsFile == "" || *kwFile == "" {
-		fmt.Fprintf(os.Stderr, "%sUsage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-p <max_pages>]%s\n", colorRed, colorReset)
+		fmt.Fprintf(os.Stderr, "%sUsage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-fc] [-fp] [-fi] [-fa] [-p <max_pages>] [-n <scan_name>]%s\n", colorRed, colorReset)
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -82,6 +89,16 @@ func main() {
 	}
 	ctx := context.Background()
 
+	// ── Resolve -fa into individual flags ────────────────────────────────────
+	if *scanAll {
+		*scanFofM    = true
+		*scanFofF    = true
+		*scanCommits = true
+		*scanProjects = true
+		*scanIssues  = true
+		info("Scan-all enabled — activating: -fm -ff -fc -fp -fi")
+	}
+
 	orgMap := make(map[string]*OrgData, len(orgs))
 	for _, o := range orgs {
 		orgMap[o] = &OrgData{}
@@ -93,9 +110,9 @@ func main() {
 	for _, org := range orgs {
 		info("Organization: %s%s%s", colorBold, org, colorGreen)
 
-		orgMap[org].Members = fetchOrgMembers(ctx, client, org, *maxPages)
+		orgMap[org].Members  = fetchOrgMembers(ctx, client, org, *maxPages)
 		orgMap[org].Followers = fetchFollowers(ctx, client, org, *maxPages)
-		orgMap[org].Repos = fetchOrgRepos(ctx, client, org, *maxPages)
+		orgMap[org].Repos    = fetchOrgRepos(ctx, client, org, *maxPages)
 
 		bullet("Members  : %d", len(orgMap[org].Members))
 		bullet("Followers: %d", len(orgMap[org].Followers))
@@ -112,22 +129,15 @@ func main() {
 		}
 
 		seen := make(map[string]bool)
-		for _, u := range orgMap[org].Followers {
-			seen[u] = true
-		}
-		for _, u := range orgMap[org].Members {
-			seen[u] = true
-		}
+		for _, u := range orgMap[org].Followers { seen[u] = true }
+		for _, u := range orgMap[org].Members   { seen[u] = true }
 
 		var network []string
 
 		if *scanFofM {
 			for _, member := range orgMap[org].Members {
 				for _, u := range fetchFollowers(ctx, client, member, *maxPages) {
-					if !seen[u] {
-						seen[u] = true
-						network = append(network, u)
-					}
+					if !seen[u] { seen[u] = true; network = append(network, u) }
 				}
 			}
 		}
@@ -135,16 +145,80 @@ func main() {
 		if *scanFofF {
 			for _, follower := range orgMap[org].Followers {
 				for _, u := range fetchFollowers(ctx, client, follower, *maxPages) {
-					if !seen[u] {
-						seen[u] = true
-						network = append(network, u)
-					}
+					if !seen[u] { seen[u] = true; network = append(network, u) }
 				}
 			}
 		}
 
 		orgMap[org].FollowerNetwork = network
 		info("Org %s%s%s — extended network: %d additional users", colorBold, org, colorGreen, len(network))
+	}
+
+	// ── Commit history scan ───────────────────────────────────────────────────
+
+	if *scanCommits {
+		header("Scanning Commit History")
+		for _, org := range orgs {
+			// Build a set of all already-known users for this org
+			known := make(map[string]bool)
+			for _, u := range orgMap[org].Members         { known[u] = true }
+			for _, u := range orgMap[org].Followers       { known[u] = true }
+			for _, u := range orgMap[org].FollowerNetwork { known[u] = true }
+
+			var commitUsers []string
+			for _, repo := range orgMap[org].Repos {
+				contributors := fetchRepoCommitUsers(ctx, client, org, repo, *maxPages)
+				for _, u := range contributors {
+					if !known[u] {
+						known[u] = true
+						commitUsers = append(commitUsers, u)
+					}
+				}
+			}
+
+			orgMap[org].CommitUsers = commitUsers
+			info("Org %s%s%s — %d new users found in commit history", colorBold, org, colorGreen, len(commitUsers))
+		}
+	}
+
+	// ── Projects scan ─────────────────────────────────────────────────────────
+
+	if *scanProjects {
+		header("Scanning Org Projects")
+		for _, org := range orgs {
+			known := buildKnownSet(orgMap[org])
+			var projectUsers []string
+			users := fetchProjectUsers(ctx, client, org, *maxPages)
+			for _, u := range users {
+				if !known[u] {
+					known[u] = true
+					projectUsers = append(projectUsers, u)
+				}
+			}
+			orgMap[org].ProjectUsers = projectUsers
+			info("Org %s%s%s — %d new users found in projects", colorBold, org, colorGreen, len(projectUsers))
+		}
+	}
+
+	// ── Issues scan ───────────────────────────────────────────────────────────
+
+	if *scanIssues {
+		header("Scanning Repository Issues")
+		for _, org := range orgs {
+			known := buildKnownSet(orgMap[org])
+			var issueUsers []string
+			for _, repo := range orgMap[org].Repos {
+				users := fetchIssueUsers(ctx, client, org, repo, *maxPages)
+				for _, u := range users {
+					if !known[u] {
+						known[u] = true
+						issueUsers = append(issueUsers, u)
+					}
+				}
+			}
+			orgMap[org].IssueUsers = issueUsers
+			info("Org %s%s%s — %d new users found in issues", colorBold, org, colorGreen, len(issueUsers))
+		}
 	}
 
 	// ── Keyword filtering ─────────────────────────────────────────────────────
@@ -170,6 +244,27 @@ func main() {
 			}
 		}
 
+		// Filter commit history users
+		for _, u := range orgMap[org].CommitUsers {
+			if matchesKeywords(ctx, client, u, keywords) {
+				filtered = append(filtered, u)
+			}
+		}
+
+		// Filter project users
+		for _, u := range orgMap[org].ProjectUsers {
+			if matchesKeywords(ctx, client, u, keywords) {
+				filtered = append(filtered, u)
+			}
+		}
+
+		// Filter issue users
+		for _, u := range orgMap[org].IssueUsers {
+			if matchesKeywords(ctx, client, u, keywords) {
+				filtered = append(filtered, u)
+			}
+		}
+
 		orgMap[org].FilteredUsers = filtered
 		info("Org %s%s%s — %d filtered users", colorBold, org, colorGreen, len(filtered))
 	}
@@ -186,6 +281,9 @@ func main() {
 		combined := d.Members
 		combined = append(combined, d.Followers...)
 		combined = append(combined, d.FollowerNetwork...)
+		combined = append(combined, d.CommitUsers...)
+		combined = append(combined, d.ProjectUsers...)
+		combined = append(combined, d.IssueUsers...)
 		return combined
 	}))
 
@@ -193,20 +291,19 @@ func main() {
 		return d.FilteredUsers
 	}))
 
-
 	if *scanName == "" {
+		filenameAllUsers      = "all_users.txt"
 		filenameFilteredUsers = "filtered_users.txt"
-		filenameAllUsers = "all_users.txt"
 	} else {
+		filenameAllUsers      = *scanName + "-all_users.txt"
 		filenameFilteredUsers = *scanName + "-filtered_users.txt"
-		filenameAllUsers = *scanName + "-all_users.txt"
 	}
 
 	writeLines(filenameAllUsers, allUsers)
-	info("Wrote %d unique users → all_users.txt", len(allUsers))
+	info("Wrote %d unique users → %s", len(allUsers), filenameAllUsers)
 
 	writeLines(filenameFilteredUsers, filteredUsers)
-	info("Wrote %d unique filtered users → filtered_users.txt", len(filteredUsers))
+	info("Wrote %d unique filtered users → %s", len(filteredUsers), filenameFilteredUsers)
 }
 
 // ── Terminal report ───────────────────────────────────────────────────────────
@@ -233,31 +330,48 @@ func printReport(orgs []string, orgMap map[string]*OrgData) {
 			bullet("%s", u)
 		}
 
-		fmt.Printf("  %s%-18s%s (%d — see all_users.txt)\n", colorBold, "Extended Network", colorReset, len(d.FollowerNetwork))
+		fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Extended Network", colorReset, len(d.FollowerNetwork), "all_users.txt")
 
-		// Only show extended-network users that made it into the filtered list
+		if len(d.CommitUsers) > 0 {
+			fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Commit History", colorReset, len(d.CommitUsers), "all_users.txt")
+		}
+		if len(d.ProjectUsers) > 0 {
+			fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Projects", colorReset, len(d.ProjectUsers), "all_users.txt")
+		}
+		if len(d.IssueUsers) > 0 {
+			fmt.Printf("  %s%-18s%s (%d — see %s)\n", colorBold, "Issues", colorReset, len(d.IssueUsers), "all_users.txt")
+		}
+
 		memberSet := make(map[string]bool, len(d.Members))
-		for _, u := range d.Members {
-			memberSet[u] = true
-		}
+		for _, u := range d.Members { memberSet[u] = true }
 		followerSet := make(map[string]bool, len(d.Followers))
-		for _, u := range d.Followers {
-			followerSet[u] = true
-		}
+		for _, u := range d.Followers { followerSet[u] = true }
+		commitSet := make(map[string]bool, len(d.CommitUsers))
+		for _, u := range d.CommitUsers { commitSet[u] = true }
+		projectSet := make(map[string]bool, len(d.ProjectUsers))
+		for _, u := range d.ProjectUsers { projectSet[u] = true }
+		issueSet := make(map[string]bool, len(d.IssueUsers))
+		for _, u := range d.IssueUsers { issueSet[u] = true }
+
 		fmt.Printf("  %s%-18s%s (%d)\n", colorBold, "Filtered Users", colorReset, len(d.FilteredUsers))
 		for _, u := range d.FilteredUsers {
 			source := "member"
-			if !memberSet[u] && followerSet[u] {
+			switch {
+			case !memberSet[u] && followerSet[u]:
 				source = "direct follower"
-			} else if !memberSet[u] && !followerSet[u] {
+			case !memberSet[u] && !followerSet[u] && commitSet[u]:
+				source = "commit history"
+			case !memberSet[u] && !followerSet[u] && projectSet[u]:
+				source = "project"
+			case !memberSet[u] && !followerSet[u] && issueSet[u]:
+				source = "issue"
+			case !memberSet[u] && !followerSet[u]:
 				source = "extended network"
 			}
 			bullet("%s%s%s %s(%s)%s", colorGreen, u, colorReset, colorYellow, source, colorReset)
 		}
 	}
 }
-
-// ── GitHub helpers ────────────────────────────────────────────────────────────
 
 // ── Rate limit helpers ────────────────────────────────────────────────────────
 
@@ -285,14 +399,10 @@ func isRateLimitErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	_, ok := err.(*github.RateLimitError)
-	if ok {
+	if _, ok := err.(*github.RateLimitError); ok {
 		return true
 	}
-	if strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "429") {
-		return true
-	}
-	return false
+	return strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "429")
 }
 
 func handleAPIErr(label string, err error, resp *github.Response) bool {
@@ -386,6 +496,158 @@ func fetchOrgRepos(ctx context.Context, client *github.Client, org string, maxPa
 	return names
 }
 
+// buildKnownSet returns a set of all users discovered so far for an org.
+func buildKnownSet(d *OrgData) map[string]bool {
+	known := make(map[string]bool)
+	for _, u := range d.Members         { known[u] = true }
+	for _, u := range d.Followers       { known[u] = true }
+	for _, u := range d.FollowerNetwork { known[u] = true }
+	for _, u := range d.CommitUsers     { known[u] = true }
+	for _, u := range d.ProjectUsers    { known[u] = true }
+	for _, u := range d.IssueUsers      { known[u] = true }
+	return known
+}
+
+func fetchProjectUsers(ctx context.Context, client *github.Client, org string, maxPages int) []string {
+	projOpts := &github.ProjectListOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	seen := make(map[string]bool)
+	var names []string
+	page := 0
+	for {
+		projects, resp, err := client.Organizations.ListProjects(ctx, org, projOpts)
+		if handleAPIErr("ListProjects:"+org, err, resp) {
+			break
+		}
+		checkRateLimit(resp, "ListProjects:"+org)
+		for _, proj := range projects {
+			// Project creator
+			if proj.Creator != nil {
+				if u := proj.Creator.GetLogin(); u != "" && !seen[u] {
+					seen[u] = true
+					names = append(names, u)
+				}
+			}
+			// Drill into columns → cards
+			colOpts := &github.ListOptions{PerPage: 100}
+			for {
+				cols, colResp, colErr := client.Projects.ListProjectColumns(ctx, proj.GetID(), colOpts)
+				if handleAPIErr(fmt.Sprintf("ListProjectColumns:%d", proj.GetID()), colErr, colResp) {
+					break
+				}
+				checkRateLimit(colResp, fmt.Sprintf("ListProjectColumns:%d", proj.GetID()))
+				for _, col := range cols {
+					cardOpts := &github.ProjectCardListOptions{
+						ListOptions: github.ListOptions{PerPage: 100},
+					}
+					for {
+						cards, cardResp, cardErr := client.Projects.ListProjectCards(ctx, col.GetID(), cardOpts)
+						if handleAPIErr(fmt.Sprintf("ListProjectCards:%d", col.GetID()), cardErr, cardResp) {
+							break
+						}
+						checkRateLimit(cardResp, fmt.Sprintf("ListProjectCards:%d", col.GetID()))
+						for _, card := range cards {
+							if card.Creator != nil {
+								if u := card.Creator.GetLogin(); u != "" && !seen[u] {
+									seen[u] = true
+									names = append(names, u)
+								}
+							}
+						}
+						if cardResp.NextPage == 0 {
+							break
+						}
+						cardOpts.Page = cardResp.NextPage
+					}
+				}
+				if colResp.NextPage == 0 {
+					break
+				}
+				colOpts.Page = colResp.NextPage
+			}
+		}
+		page++
+		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+			break
+		}
+		projOpts.Page = resp.NextPage
+	}
+	return names
+}
+
+func fetchIssueUsers(ctx context.Context, client *github.Client, org, repo string, maxPages int) []string {
+	opts := &github.IssueListByRepoOptions{
+		State:       "all",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	seen := make(map[string]bool)
+	var names []string
+	page := 0
+	for {
+		issues, resp, err := client.Issues.ListByRepo(ctx, org, repo, opts)
+		if handleAPIErr("ListIssues:"+org+"/"+repo, err, resp) {
+			break
+		}
+		checkRateLimit(resp, "ListIssues:"+org+"/"+repo)
+		for _, issue := range issues {
+			// Issue author
+			if u := issue.GetUser().GetLogin(); u != "" && !seen[u] {
+				seen[u] = true
+				names = append(names, u)
+			}
+			// Assignees
+			for _, a := range issue.Assignees {
+				if u := a.GetLogin(); u != "" && !seen[u] {
+					seen[u] = true
+					names = append(names, u)
+				}
+			}
+		}
+		page++
+		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return names
+}
+
+func fetchRepoCommitUsers(ctx context.Context, client *github.Client, org, repo string, maxPages int) []string {	opts := &github.CommitsListOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	seen := make(map[string]bool)
+	var names []string
+	page := 0
+	for {
+		commits, resp, err := client.Repositories.ListCommits(ctx, org, repo, opts)
+		if handleAPIErr("ListCommits:"+org+"/"+repo, err, resp) {
+			break
+		}
+		checkRateLimit(resp, "ListCommits:"+org+"/"+repo)
+		for _, c := range commits {
+			// Prefer the associated GitHub account login; fall back to git author name
+			var login string
+			if c.Author != nil {
+				login = c.Author.GetLogin()
+			}
+			if login == "" && c.Commit != nil && c.Commit.Author != nil {
+				login = c.Commit.Author.GetName()
+			}
+			if login != "" && !seen[login] {
+				seen[login] = true
+				names = append(names, login)
+			}
+		}
+		page++
+		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return names
+}
+
 func matchesKeywords(ctx context.Context, client *github.Client, login string, keywords []string) bool {
 	u, resp, err := client.Users.Get(ctx, login)
 	if handleAPIErr("Users.Get:"+login, err, resp) {
@@ -404,7 +666,7 @@ func matchesKeywords(ctx context.Context, client *github.Client, login string, k
 	}
 
 	company := normalize(u.GetCompany())
-	bio := normalize(u.GetBio())
+	bio     := normalize(u.GetBio())
 
 	for _, kw := range keywords {
 		kw = normalize(strings.TrimSpace(kw))
@@ -455,7 +717,7 @@ func writeLines(path string, lines []string) {
 
 func dedupe(s []string) []string {
 	seen := make(map[string]bool, len(s))
-	out := make([]string, 0, len(s))
+	out  := make([]string, 0, len(s))
 	for _, v := range s {
 		if !seen[v] {
 			seen[v] = true
