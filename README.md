@@ -16,9 +16,9 @@ go build .
 
 Create files containing newline delimited lists of organizations and keywords. Specify these files using -o for organizations and -k for keywords. 
 
-Default: scan without a PAT token. Limited to 60 requests per hour.
+Default: scan without a PAT token. Limited to 60 requests per hour. Use -n to name the output files.
 ```
-Github-Scanner -o orgs.txt -k keywords.txt
+Github-Scanner -o orgs.txt -k keywords.txt -n my_scan
 ```
 
 Activate all scanning options using:
@@ -35,6 +35,15 @@ Requests can be limited by page. The following example only fetches the first pa
 ```
 Github-Scanner -o orgs.txt -k keywords.txt -p 1
 ```
+
+# Output 
+
+Four files will be output: 
+- all_users.txt: file containing ALL users found using the provided scan options. Does not include followers of followers.
+- all_users_meta.yaml: file breaks down where the script found each user. Does not include followers of followers
+- filtered_users.txt: file shows users that have keywords in the bio or company fields of their profile.
+- network_users.txt: users following organization followers and members are saved here.
+
 
 # Args
 ```
