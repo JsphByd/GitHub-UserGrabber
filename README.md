@@ -62,3 +62,7 @@ Usage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] 
   -t string
         GitHub Personal Access Token (required to avoid rate limiting)
 ```
+
+# Example Output
+<img width="953" height="909" alt="image" src="https://github.com/user-attachments/assets/5304e188-3fa7-4585-9f94-30eb6fd03004" />
+
