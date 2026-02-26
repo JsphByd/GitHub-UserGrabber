@@ -49,7 +49,7 @@ type OrgData struct {
 	CommitUsers     []string // verified GitHub logins from commit history
 	ProjectUsers    []string // users found in org projects
 	IssueUsers      []string // users found in repo issues
-	UnverifiedUsers []string // git author names not linked to a GitHub account
+
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -76,12 +76,10 @@ func main() {
 
 	// ── Resolve -fa into individual flags ─────────────────────────────────────
 	if *scanAll {
-		*scanFofM     = true
-		*scanFofF     = true
 		*scanCommits  = true
 		*scanProjects = true
 		*scanIssues   = true
-		info("Scan-all enabled — activating: -fm -ff -fc -fp -fi")
+		info("Scan-all enabled — activating: -fc -fp -fi")
 	}
 
 	orgs, err := readLines(*orgsFile)
@@ -122,39 +120,45 @@ func main() {
 		bullet("Repos    : %d", len(orgMap[org].Repos))
 	}
 
-	// ── Follower network ──────────────────────────────────────────────────────
+	// ── Follower network keyword scan ─────────────────────────────────────────
 
-	header("Building Follower Network")
-	for _, org := range orgs {
-		if !*scanFofM && !*scanFofF {
-			info("Skipping extended network scan (use -fm and/or -ff to enable)")
-			break
-		}
+	var secondaryKeywordUsers []string
+	if *scanFofM || *scanFofF {
+		header("Scanning Follower Network for Keyword Matches")
+		seenSecondary := make(map[string]bool)
+		for _, org := range orgs {
+			seen := make(map[string]bool)
+			for _, u := range orgMap[org].Followers { seen[u] = true }
+			for _, u := range orgMap[org].Members   { seen[u] = true }
 
-		seen := make(map[string]bool)
-		for _, u := range orgMap[org].Followers { seen[u] = true }
-		for _, u := range orgMap[org].Members   { seen[u] = true }
+			var candidates []string
 
-		var network []string
+			if *scanFofM {
+				for _, member := range orgMap[org].Members {
+					for _, u := range fetchFollowers(ctx, client, member, *maxPages) {
+						if !seen[u] { seen[u] = true; candidates = append(candidates, u) }
+					}
+				}
+			}
 
-		if *scanFofM {
-			for _, member := range orgMap[org].Members {
-				for _, u := range fetchFollowers(ctx, client, member, *maxPages) {
-					if !seen[u] { seen[u] = true; network = append(network, u) }
+			if *scanFofF {
+				for _, follower := range orgMap[org].Followers {
+					for _, u := range fetchFollowers(ctx, client, follower, *maxPages) {
+						if !seen[u] { seen[u] = true; candidates = append(candidates, u) }
+					}
+				}
+			}
+
+			info("Org %s%s%s — checking %d follower network users for keyword matches", colorBold, org, colorGreen, len(candidates))
+			for _, u := range candidates {
+				if matchesKeywords(ctx, client, u, keywords) {
+					if !seenSecondary[u] {
+						seenSecondary[u] = true
+						secondaryKeywordUsers = append(secondaryKeywordUsers, u)
+					}
 				}
 			}
 		}
-
-		if *scanFofF {
-			for _, follower := range orgMap[org].Followers {
-				for _, u := range fetchFollowers(ctx, client, follower, *maxPages) {
-					if !seen[u] { seen[u] = true; network = append(network, u) }
-				}
-			}
-		}
-
-		orgMap[org].FollowerNetwork = network
-		info("Org %s%s%s — extended network: %d additional users", colorBold, org, colorGreen, len(network))
 	}
 
 	// ── Commit history scan ───────────────────────────────────────────────────
@@ -164,23 +168,14 @@ func main() {
 		for _, org := range orgs {
 			known := buildKnownSet(orgMap[org])
 			var commitUsers []string
-			var unverifiedUsers []string
-			seenUnverified := make(map[string]bool)
 			for _, repo := range orgMap[org].Repos {
-				verified, unverified := fetchRepoCommitUsers(ctx, client, org, repo, *maxPages)
+				verified := fetchRepoCommitUsers(ctx, client, org, repo, *maxPages)				
 				for _, u := range verified {
 					if !known[u] { known[u] = true; commitUsers = append(commitUsers, u) }
 				}
-				for _, u := range unverified {
-					if !seenUnverified[u] { seenUnverified[u] = true; unverifiedUsers = append(unverifiedUsers, u) }
-				}
 			}
-			orgMap[org].CommitUsers     = commitUsers
-			orgMap[org].UnverifiedUsers = unverifiedUsers
-			info("Org %s%s%s — %d new users found in commit history (%d unverified)", colorBold, org, colorGreen, len(commitUsers), len(unverifiedUsers))
-			for _, u := range unverifiedUsers {
-				bullet("unverified: %s", u)
-			}
+			orgMap[org].CommitUsers = commitUsers
+			info("Org %s%s%s — %d new users found in commit history", colorBold, org, colorGreen, len(commitUsers))
 		}
 	}
 
@@ -222,11 +217,8 @@ func main() {
 	for _, org := range orgs {
 		var keywordUsers []string
 
-		// followers, network, commit, project, issue users are keyword-filtered
-		// members are NOT keyword filtered — they go straight to likely_associated
 		candidates := []string{}
 		candidates = append(candidates, orgMap[org].Followers...)
-		candidates = append(candidates, orgMap[org].FollowerNetwork...)
 		candidates = append(candidates, orgMap[org].CommitUsers...)
 		candidates = append(candidates, orgMap[org].ProjectUsers...)
 		candidates = append(candidates, orgMap[org].IssueUsers...)
@@ -237,8 +229,9 @@ func main() {
 			}
 		}
 
-		orgMap[org].KeywordUsers = keywordUsers
-		info("Org %s%s%s — %d keyword-matched users", colorBold, org, colorGreen, len(keywordUsers))
+		orgMap[org].KeywordUsers = append(orgMap[org].KeywordUsers, keywordUsers...)
+		orgMap[org].KeywordUsers = dedupe(orgMap[org].KeywordUsers)
+		info("Org %s%s%s — %d keyword-matched users", colorBold, org, colorGreen, len(orgMap[org].KeywordUsers))
 	}
 
 	// ── Terminal report ───────────────────────────────────────────────────────
@@ -251,14 +244,12 @@ func main() {
 	if *scanName != "" {
 		prefix = *scanName + "-"
 	}
-	fnAllUsers            := prefix + "all_users.txt"
-	fnAllUsersMeta        := prefix + "all_users_meta.yaml"
-	fnFollowers           := prefix + "org_followers.txt"
-	fnNetworkUsers        := prefix + "network_users.txt"
-	fnKeywordUsers        := prefix + "keyword_users.txt"
-	fnLikelyAssociated   := prefix + "likely_associated_users.txt"
-	fnUnverifiedUsers     := prefix + "unverified_users.txt"
-
+	fnAllUsers                  := prefix + "all_users.txt"
+	fnAllUsersMeta              := prefix + "all_users_meta.yaml"
+	fnFollowers                 := prefix + "org_followers.txt"
+	fnKeywordUsers              := prefix + "keyword_users.txt"
+	fnLikelyAssociated          := prefix + "likely_associated_users.txt"
+	fnSecondaryKeywordUsers     := prefix + "keyword_filtered_secondary_users.txt"
 	// ── Build output lists ────────────────────────────────────────────────────
 
 	// all_users: every single user scanned
@@ -266,7 +257,6 @@ func main() {
 		out := []string{}
 		out = append(out, d.Members...)
 		out = append(out, d.Followers...)
-		out = append(out, d.FollowerNetwork...)
 		out = append(out, d.CommitUsers...)
 		out = append(out, d.ProjectUsers...)
 		out = append(out, d.IssueUsers...)
@@ -277,11 +267,6 @@ func main() {
 	// org_followers: direct org followers only
 	orgFollowers := dedupe(collectField(orgMap, func(d *OrgData) []string {
 		return d.Followers
-	}))
-
-	// network_users: followers of followers/members
-	networkUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
-		return d.FollowerNetwork
 	}))
 
 	// keyword_users: users matched by keyword search
@@ -300,11 +285,6 @@ func main() {
 		return out
 	}))
 
-	// unverified: git authors not linked to GitHub accounts
-	unverifiedUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
-		return d.UnverifiedUsers
-	}))
-
 	// ── Write output files ────────────────────────────────────────────────────
 
 	header("Writing Output Files")
@@ -318,18 +298,15 @@ func main() {
 	writeLines(fnFollowers, orgFollowers)
 	info("Wrote %d org followers → %s", len(orgFollowers), fnFollowers)
 
-	writeLines(fnNetworkUsers, networkUsers)
-	info("Wrote %d extended network users → %s", len(networkUsers), fnNetworkUsers)
-
 	writeLines(fnKeywordUsers, keywordUsers)
 	info("Wrote %d keyword-matched users → %s", len(keywordUsers), fnKeywordUsers)
 
 	writeLines(fnLikelyAssociated, likelyAssociated)
 	info("Wrote %d likely associated users → %s", len(likelyAssociated), fnLikelyAssociated)
 
-	if *scanCommits && len(unverifiedUsers) > 0 {
-		writeLines(fnUnverifiedUsers, unverifiedUsers)
-		info("Wrote %d unverified git authors → %s", len(unverifiedUsers), fnUnverifiedUsers)
+	if *scanFofM || *scanFofF {
+		writeLines(fnSecondaryKeywordUsers, secondaryKeywordUsers)
+		info("Wrote %d secondary keyword-matched users → %s", len(secondaryKeywordUsers), fnSecondaryKeywordUsers)
 	}
 }
 
@@ -349,8 +326,6 @@ func printReport(orgs []string, orgMap map[string]*OrgData) {
 		for _, u := range d.Members { bullet("%s", u) }
 
 		fmt.Printf("  %s%-22s%s (%d — see org_followers.txt)\n", colorBold, "Followers", colorReset, len(d.Followers))
-
-		fmt.Printf("  %s%-22s%s (%d — see network_users.txt)\n", colorBold, "Extended Network", colorReset, len(d.FollowerNetwork))
 
 		if len(d.CommitUsers) > 0 {
 			fmt.Printf("  %s%-22s%s (%d — see likely_associated_users.txt)\n", colorBold, "Commit Users", colorReset, len(d.CommitUsers))
@@ -386,12 +361,10 @@ func writeUserMeta(path string, orgs []string, orgMap map[string]*OrgData) {
 
 		writeYAMLCategory(w, "members", d.Members)
 		writeYAMLCategory(w, "followers", d.Followers)
-		writeYAMLCategory(w, "follower_network", d.FollowerNetwork)
 		writeYAMLCategory(w, "commit_history", d.CommitUsers)
 		writeYAMLCategory(w, "projects", d.ProjectUsers)
 		writeYAMLCategory(w, "issues", d.IssueUsers)
 		writeYAMLCategory(w, "keyword_matches", d.KeywordUsers)
-		writeYAMLCategory(w, "unverified_git_authors", d.UnverifiedUsers)
 	}
 
 	fatalIf("flushing "+path, w.Flush())
@@ -518,12 +491,11 @@ func fetchOrgRepos(ctx context.Context, client *github.Client, org string, maxPa
 // buildKnownSet returns a set of all users discovered so far for an org.
 func buildKnownSet(d *OrgData) map[string]bool {
 	known := make(map[string]bool)
-	for _, u := range d.Members         { known[u] = true }
-	for _, u := range d.Followers       { known[u] = true }
-	for _, u := range d.FollowerNetwork { known[u] = true }
-	for _, u := range d.CommitUsers     { known[u] = true }
-	for _, u := range d.ProjectUsers    { known[u] = true }
-	for _, u := range d.IssueUsers      { known[u] = true }
+	for _, u := range d.Members      { known[u] = true }
+	for _, u := range d.Followers    { known[u] = true }
+	for _, u := range d.CommitUsers  { known[u] = true }
+	for _, u := range d.ProjectUsers { known[u] = true }
+	for _, u := range d.IssueUsers   { known[u] = true }
 	return known
 }
 
@@ -743,10 +715,10 @@ func fetchIssueUsers(ctx context.Context, client *github.Client, org, repo strin
 	return names
 }
 
-func fetchRepoCommitUsers(ctx context.Context, client *github.Client, org, repo string, maxPages int) (verified []string, unverified []string) {
+func fetchRepoCommitUsers(ctx context.Context, client *github.Client, org, repo string, maxPages int) []string {
 	opts := &github.CommitsListOptions{ListOptions: github.ListOptions{PerPage: 100}}
-	seenV := make(map[string]bool)
-	seenU := make(map[string]bool)
+	seen := make(map[string]bool)
+	var verified []string
 	page := 0
 	for {
 		commits, resp, err := client.Repositories.ListCommits(ctx, org, repo, opts)
@@ -754,16 +726,9 @@ func fetchRepoCommitUsers(ctx context.Context, client *github.Client, org, repo 
 		checkRateLimit(resp, "ListCommits:"+org+"/"+repo)
 		for _, c := range commits {
 			if c.Author != nil {
-				if login := c.Author.GetLogin(); login != "" && !seenV[login] {
-					seenV[login] = true
+				if login := c.Author.GetLogin(); login != "" && !seen[login] {
+					seen[login] = true
 					verified = append(verified, login)
-					continue
-				}
-			}
-			if c.Commit != nil && c.Commit.Author != nil {
-				if name := c.Commit.Author.GetName(); name != "" && !seenU[name] {
-					seenU[name] = true
-					unverified = append(unverified, name)
 				}
 			}
 		}
@@ -771,7 +736,7 @@ func fetchRepoCommitUsers(ctx context.Context, client *github.Client, org, repo 
 		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) { break }
 		opts.Page = resp.NextPage
 	}
-	return verified, unverified
+	return verified
 }
 
 func matchesKeywords(ctx context.Context, client *github.Client, login string, keywords []string) bool {
@@ -845,7 +810,6 @@ func collectField(m map[string]*OrgData, fn func(*OrgData) []string) []string {
 	for _, d := range m { out = append(out, fn(d)...) }
 	return out
 }
-
 
 func fatalIf(ctx string, err error) {
 	if err != nil {
