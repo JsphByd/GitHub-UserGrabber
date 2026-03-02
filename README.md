@@ -38,38 +38,45 @@ Github-Scanner -o orgs.txt -k keywords.txt -p 1
 
 # Output 
 
-Four files will be output: 
-- all_users.txt: file containing ALL users found using the provided scan options. Does not include followers of followers.
-- all_users_meta.yaml: file breaks down where the script found each user. Does not include followers of followers
-- filtered_users.txt: file shows users that have keywords in the bio or company fields of their profile.
-- network_users.txt: users following organization followers and members are saved here.
+Five files will be output: 
+- all_users.txt: file containing all scanned users, including followers.
+- likely_associated_users.txt: file contains all scanned users, except followers. 
+- all_users_meta.yaml: file breaks down where the script found each user. Does not include followers of followers.
+- keyword_users.txt: file shows users that have keywords in their GitHub profile bio, company field, or README file.
+- org_followers.txt: file contains a list of users following the organization.
 
+If using the -u and -s flags together, the following files may be output: 
+- keyword_user_scan.txt: file contains users containing the specified keywords. Only generated if a file of users is provided as input to the -u flag.
+- keyword_filtered_secondary_users.txt: file contains users that are following/followed by users in the -u flag. Only generated if -s is specified.
 
 # Args
 ```
-Usage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-fc] [-fp] [-fi] [-fa] [-p <max_pages>] [-n <scan_name>]
+Usage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-fc] [-fp] [-fi] [-fa] [-u <users_file>] [-p <max_pages>] [-n <scan_name>]
   -fa
-        Scan everything: members, followers, followers-of-members/followers, projects, commits, and issues
+        Scan everything: members, followers, commits, projects, and issues
   -fc
         Also scan commit history of org repositories for contributors
   -ff
-        Also scan followers of org followers
+        Scan followers of org followers and keyword-filter them
   -fi
         Also scan repository issues for new users
   -fm
-        Also scan followers of org members
+        Scan followers of org members and keyword-filter them
   -fp
         Also scan org projects for new users
   -k string
         Path to file containing keywords to filter users (one per line)
   -n string
-        Filename to save results under
+        Filename prefix to save results under
   -o string
         Path to file containing GitHub organization names (one per line)
   -p int
         Max number of pages to fetch per API call (0 = unlimited)
+  -s    Scan following/follower lists when using -u option
   -t string
         GitHub Personal Access Token (required to avoid rate limiting)
+  -u string
+        Path to a newline-delimited .txt file of GitHub usernames to keyword-scan
 ```
 
 # Example Output
