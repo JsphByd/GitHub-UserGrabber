@@ -12,13 +12,13 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
 )
 
 // ── ANSI colors ──────────────────────────────────────────────────────────────
-
 const (
 	colorReset  = "\033[0m"
 	colorBold   = "\033[1m"
@@ -39,25 +39,21 @@ func warn(f string, a ...any) {
 func bullet(f string, a ...any) { fmt.Printf("    • "+f+"\n", a...) }
 
 // ── Data structures ───────────────────────────────────────────────────────────
-
-// UserEntry pairs a GitHub login with the URL where they were found.
-// URL is empty for sources that don't have a meaningful per-user URL (members, followers).
 type UserEntry struct {
 	Login string
 	URL   string
 }
 
 type OrgData struct {
-	Members      []string    // logins only — no specific URL
-	Followers    []string    // logins only — no specific URL
+	Members      []string
+	Followers    []string
 	Repos        []string
-	KeywordUsers []string    // logins only
-	CommitUsers  []UserEntry // login + repo URL
-	ProjectUsers []UserEntry // login + project URL
-	IssueUsers   []UserEntry // login + issue URL
+	KeywordUsers []string
+	CommitUsers  []UserEntry
+	ProjectUsers []UserEntry
+	IssueUsers   []UserEntry
 }
 
-// logins extracts just the Login field from a []UserEntry.
 func logins(entries []UserEntry) []string {
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
@@ -66,31 +62,151 @@ func logins(entries []UserEntry) []string {
 	return out
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── OrgSearchResult holds a discovered organization ───────────────────────────
+type OrgSearchResult struct {
+	Login       string
+	Name        string
+	URL         string
+	Description string
+}
 
+// ── searchOrgsByKeywords searches GitHub for orgs matching each keyword ───────
+// Uses the GitHub Search API (type:org) to find organizations matching each
+// keyword. Deduplicates across keywords. Skips keywords with no org results.
+// Writes: <prefix>org_search_results.txt
+func searchOrgsByKeywords(ctx context.Context, client *github.Client, keywords []string, maxPages int, prefix string) {
+	header("Searching GitHub for Organizations by Keyword")
+
+	seen := make(map[string]bool)
+	var results []OrgSearchResult
+
+	for _, kw := range keywords {
+		kw = strings.TrimSpace(kw)
+		if kw == "" {
+			continue
+		}
+
+		info("Keyword: %q", kw)
+		opts := &github.SearchOptions{
+			ListOptions: github.ListOptions{PerPage: 100},
+		}
+		query := fmt.Sprintf("%s type:org", kw)
+		page := 0
+		foundThisKeyword := 0
+
+		for {
+			result, resp, err := client.Search.Users(ctx, query, opts)
+			if handleAPIErr("Search.Users:"+kw, err, resp) {
+				break
+			}
+			checkRateLimit(resp, "Search.Users:"+kw)
+
+			for _, u := range result.Users {
+				if u.GetType() != "Organization" {
+					continue
+				}
+				loginKey := strings.ToLower(u.GetLogin())
+				if seen[loginKey] {
+					continue
+				}
+				seen[loginKey] = true
+
+				// Fetch full org details for display name and description
+				name := u.GetLogin()
+				description := "(no description)"
+				org, orgResp, orgErr := client.Organizations.Get(ctx, u.GetLogin())
+				if orgErr == nil && org != nil {
+					checkRateLimit(orgResp, "Organizations.Get:"+u.GetLogin())
+					if org.GetName() != "" {
+						name = org.GetName()
+					}
+					if org.GetDescription() != "" {
+						description = org.GetDescription()
+					}
+				}
+
+				results = append(results, OrgSearchResult{
+					Login:       u.GetLogin(),
+					Name:        name,
+					URL:         fmt.Sprintf("https://github.com/%s", u.GetLogin()),
+					Description: description,
+				})
+				foundThisKeyword++
+			}
+
+			page++
+			if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) {
+				break
+			}
+			opts.Page = resp.NextPage
+		}
+
+		if foundThisKeyword > 0 {
+			bullet("Found %d new org(s)", foundThisKeyword)
+		} else {
+			bullet("No new orgs found")
+		}
+	}
+
+	// Write output file
+	fn := prefix + "org_search_results.txt"
+	f, err := os.Create(fn)
+	fatalIf("creating "+fn, err)
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	fmt.Fprintf(w, "GitHub Organization Search Results\n")
+	fmt.Fprintf(w, "===================================\n")
+	fmt.Fprintf(w, "Total organizations found: %d\n\n", len(results))
+	for _, r := range results {
+		fmt.Fprintf(w, "%s (@%s)\n", r.Name, r.Login)
+		fmt.Fprintf(w, "%s\n", r.URL)
+		fmt.Fprintf(w, "%s\n\n", r.Description)
+	}
+	fatalIf("flushing "+fn, w.Flush())
+
+	header("Org Search Complete")
+	info("Found %d unique organization(s) across all keywords", len(results))
+	info("Results written → %s", fn)
+
+	// Print to terminal too
+	if len(results) > 0 {
+		fmt.Println()
+		for _, r := range results {
+			fmt.Printf("  %s%s%s (@%s)\n", colorBold, r.Name, colorReset, r.Login)
+			fmt.Printf("  %s%s%s\n", colorBlue, r.URL, colorReset)
+			fmt.Printf("  %s\n\n", r.Description)
+		}
+	}
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 func main() {
-	orgsFile     := flag.String("o", "", "Path to file containing GitHub organization names (one per line)")
-	kwFile       := flag.String("k", "", "Path to file containing keywords to filter users (one per line)")
-	pat          := flag.String("t", "", "GitHub Personal Access Token (required to avoid rate limiting)")
-	scanFofM     := flag.Bool("fm", false, "Scan followers of org members and keyword-filter them")
-	scanFofF     := flag.Bool("ff", false, "Scan followers of org followers and keyword-filter them")
-	scanCommits  := flag.Bool("fc", false, "Also scan commit history of org repositories for contributors")
-	scanProjects := flag.Bool("fp", false, "Also scan org projects for new users")
-	scanIssues   := flag.Bool("fi", false, "Also scan repository issues for new users")
-	scanAll      := flag.Bool("fa", false, "Scan everything: members, followers, commits, projects, and issues")
-	userFile     := flag.String("u", "", "Path to a newline-delimited .txt file of GitHub usernames to keyword-scan")
-	maxPages     := flag.Int("p", 0, "Max number of pages to fetch per API call (0 = unlimited)")
-	scanName     := flag.String("n", "", "Filename prefix to save results under")
-	scanSocial   := flag.Bool("s", false, "Scan following/follower lists when using -u option")
+	orgsFile      := flag.String("o", "", "Path to file containing GitHub organization names (one per line)")
+	kwFile        := flag.String("k", "", "Path to file containing keywords to filter users (one per line)")
+	pat           := flag.String("t", "", "GitHub Personal Access Token (required to avoid rate limiting)")
+	scanFofM      := flag.Bool("fm", false, "Scan followers of org members and keyword-filter them")
+	scanFofF      := flag.Bool("ff", false, "Scan followers of org followers and keyword-filter them")
+	scanCommits   := flag.Bool("fc", false, "Also scan commit history of org repositories for contributors")
+	scanProjects  := flag.Bool("fp", false, "Also scan org projects for new users")
+	scanIssues    := flag.Bool("fi", false, "Also scan repository issues for new users")
+	scanAll       := flag.Bool("fa", false, "Scan everything: members, followers, commits, projects, and issues")
+	userFile      := flag.String("u", "", "Path to a newline-delimited .txt file of GitHub usernames to keyword-scan")
+	maxPages      := flag.Int("p", 0, "Max number of pages to fetch per API call (0 = unlimited)")
+	scanName      := flag.String("n", "", "Filename prefix to save results under")
+	scanSocial    := flag.Bool("s", false, "Scan following/follower lists when using -u option")
+	orgSearch     := flag.Bool("oS", false, "Search GitHub for organizations matching keywords in -k file. Writes org_search_results.txt. Can be combined with -o for a full scan.")
+	noForks       := flag.Bool("nf", false, "Exclude forked repositories from all scans (-fc, -fi, -fa)")
 	flag.Parse()
 
 	if *kwFile == "" {
-		fmt.Fprintf(os.Stderr, "%sUsage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-fc] [-fp] [-fi] [-fa] [-u <users_file>] [-p <max_pages>] [-n <scan_name>]%s\n", colorRed, colorReset)
+		fmt.Fprintf(os.Stderr, "%sUsage: github-scanner -o <orgs_file> -k <keywords_file> [-t <github_pat>] [-fm] [-ff] [-fc] [-fp] [-fi] [-fa] [-oS] [-u <users_file>] [-p <max_pages>] [-n <scan_name>]%s\n", colorRed, colorReset)
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	if *orgsFile == "" && *userFile == "" {
-		fmt.Fprintf(os.Stderr, "%sError: must provide at least -o <orgs_file> or -u <users_file>%s\n", colorRed, colorReset)
+
+	if *orgsFile == "" && *userFile == "" && !*orgSearch {
+		fmt.Fprintf(os.Stderr, "%sError: must provide at least -o <orgs_file>, -u <users_file>, or -oS%s\n", colorRed, colorReset)
 		os.Exit(1)
 	}
 
@@ -114,7 +230,22 @@ func main() {
 		client = github.NewClient(nil)
 		warn("No PAT provided — using unauthenticated requests (60 req/hour). Use -t to authenticate.")
 	}
+
 	ctx := context.Background()
+
+	prefix := ""
+	if *scanName != "" {
+		prefix = *scanName + "-"
+	}
+
+	// ── Keyword-based org search (-oS) ────────────────────────────────────────
+	// Runs first. If -oS is the only action flag, exits after writing results.
+	if *orgSearch {
+		searchOrgsByKeywords(ctx, client, keywords, *maxPages, prefix)
+		if *orgsFile == "" && *userFile == "" {
+			return
+		}
+	}
 
 	var orgs []string
 	orgMap := make(map[string]*OrgData)
@@ -144,21 +275,16 @@ func main() {
 			}
 			seen := make(map[string]bool)
 			var matched []string
-
-			// Always scan the users themselves
 			for _, u := range users {
 				seen[u] = true
 				if matchesKeywords(ctx, client, u, keywords) {
 					matched = append(matched, u)
 				}
 			}
-
-			// If -s is set, also scan each user's followers and following lists
 			if *scanSocial {
 				header("Scanning Follower/Following Networks")
 				networkSeen := make(map[string]bool)
 				for _, u := range users { networkSeen[u] = true }
-
 				var networkCandidates []string
 				for _, u := range users {
 					info("Fetching followers/following for %s", u)
@@ -176,10 +302,7 @@ func main() {
 					}
 				}
 			}
-			// Only write a file if more than one user was provided
 			if len(users) > 1 {
-				prefix := ""
-				if *scanName != "" { prefix = *scanName + "-" }
 				fn := prefix + "keyword_user_scan.txt"
 				header("Writing Output Files")
 				writeLines(fn, matched)
@@ -190,14 +313,13 @@ func main() {
 	}
 
 	// ── Fetch base data ───────────────────────────────────────────────────────
-
 	if *orgsFile != "" {
 		header("Scanning Organizations")
 		for _, org := range orgs {
 			info("Organization: %s%s%s", colorBold, org, colorGreen)
 			orgMap[org].Members   = fetchOrgMembers(ctx, client, org, *maxPages)
 			orgMap[org].Followers = fetchFollowers(ctx, client, org, *maxPages)
-			orgMap[org].Repos     = fetchOrgRepos(ctx, client, org, *maxPages)
+			orgMap[org].Repos     = fetchOrgRepos(ctx, client, org, *maxPages, *noForks)
 			bullet("Members  : %d", len(orgMap[org].Members))
 			bullet("Followers: %d", len(orgMap[org].Followers))
 			bullet("Repos    : %d", len(orgMap[org].Repos))
@@ -205,8 +327,6 @@ func main() {
 	}
 
 	// ── Follower network keyword scan (-fm / -ff) ─────────────────────────────
-	// Only produces keyword_filtered_secondary_users.txt — no other files written.
-
 	if *scanFofM || *scanFofF {
 		header("Scanning Follower Network for Keyword Matches")
 		seenSecondary := make(map[string]bool)
@@ -239,27 +359,19 @@ func main() {
 	}
 
 	// ── User file keyword scan (-u) ───────────────────────────────────────────
-	// Accepts either a path to a .txt file of usernames or a single GitHub username.
-	// Only produces keyword_filtered_secondary_users.txt — no other files written.
-
 	if *userFile != "" {
 		header("Scanning User List for Keyword Matches")
 		seenSecondary := make(map[string]bool)
 		for _, u := range secondaryKeywordUsers { seenSecondary[u] = true }
-
 		var users []string
-
-		// Detect whether the argument is a file path or a plain username
 		if _, err := os.Stat(*userFile); err == nil {
 			users, err = readLines(*userFile)
 			fatalIf("reading user file", err)
 			info("Checking %d users from %s for keyword matches", len(users), *userFile)
 		} else {
-			// Treat as a single GitHub username
 			users = []string{*userFile}
 			info("Checking single user %q for keyword matches", *userFile)
 		}
-
 		for _, u := range users {
 			if matchesKeywords(ctx, client, u, keywords) {
 				if !seenSecondary[u] { seenSecondary[u] = true; secondaryKeywordUsers = append(secondaryKeywordUsers, u) }
@@ -267,11 +379,7 @@ func main() {
 		}
 	}
 
-	// ── If only secondary scans were run, write that file and exit early ──────
-
 	if *orgsFile == "" {
-		prefix := ""
-		if *scanName != "" { prefix = *scanName + "-" }
 		fn := prefix + "keyword_filtered_secondary_users.txt"
 		header("Writing Output Files")
 		writeLines(fn, secondaryKeywordUsers)
@@ -279,12 +387,9 @@ func main() {
 		return
 	}
 
-	// ── If -fm/-ff were used alongside a full scan, only write the secondary file at the end
-
 	secondaryOnly := (*scanFofM || *scanFofF) && !*scanCommits && !*scanProjects && !*scanIssues && !*scanAll
 
 	// ── Commit history scan ───────────────────────────────────────────────────
-
 	if *scanCommits {
 		header("Scanning Commit History")
 		for _, org := range orgs {
@@ -301,7 +406,6 @@ func main() {
 	}
 
 	// ── Projects scan ─────────────────────────────────────────────────────────
-
 	if *scanProjects {
 		header("Scanning Org Projects")
 		for _, org := range orgs {
@@ -316,7 +420,6 @@ func main() {
 	}
 
 	// ── Issues scan ───────────────────────────────────────────────────────────
-
 	if *scanIssues {
 		header("Scanning Repository Issues")
 		for _, org := range orgs {
@@ -333,7 +436,6 @@ func main() {
 	}
 
 	// ── Keyword filtering ─────────────────────────────────────────────────────
-
 	header("Filtering Users by Keywords")
 	for _, org := range orgs {
 		var keywordUsers []string
@@ -351,22 +453,14 @@ func main() {
 		info("Org %s%s%s — %d keyword-matched users", colorBold, org, colorGreen, len(orgMap[org].KeywordUsers))
 	}
 
-	// ── Terminal report ───────────────────────────────────────────────────────
-
 	printReport(orgs, orgMap)
 
-	// ── Determine filenames ───────────────────────────────────────────────────
-
-	prefix := ""
-	if *scanName != "" { prefix = *scanName + "-" }
 	fnAllUsers              := prefix + "all_users.txt"
 	fnAllUsersMeta          := prefix + "all_users_meta.yaml"
 	fnFollowers             := prefix + "org_followers.txt"
 	fnKeywordUsers          := prefix + "keyword_users.txt"
 	fnLikelyAssociated      := prefix + "likely_associated_users.txt"
 	fnSecondaryKeywordUsers := prefix + "keyword_filtered_secondary_users.txt"
-
-	// ── Build output lists ────────────────────────────────────────────────────
 
 	allUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
 		out := []string{}
@@ -378,15 +472,8 @@ func main() {
 		out = append(out, d.KeywordUsers...)
 		return out
 	}))
-
-	orgFollowers := dedupe(collectField(orgMap, func(d *OrgData) []string {
-		return d.Followers
-	}))
-
-	keywordUsers := dedupe(collectField(orgMap, func(d *OrgData) []string {
-		return d.KeywordUsers
-	}))
-
+	orgFollowers := dedupe(collectField(orgMap, func(d *OrgData) []string { return d.Followers }))
+	keywordUsers := dedupe(collectField(orgMap, func(d *OrgData) []string { return d.KeywordUsers }))
 	likelyAssociated := dedupe(collectField(orgMap, func(d *OrgData) []string {
 		out := []string{}
 		out = append(out, d.Members...)
@@ -397,27 +484,19 @@ func main() {
 		return out
 	}))
 
-	// ── Write output files ────────────────────────────────────────────────────
-
 	header("Writing Output Files")
-
 	if !secondaryOnly {
 		writeLines(fnAllUsers, allUsers)
 		info("Wrote %d unique users → %s", len(allUsers), fnAllUsers)
-
 		writeUserMeta(fnAllUsersMeta, orgs, orgMap)
 		info("Wrote user source metadata → %s", fnAllUsersMeta)
-
 		writeLines(fnFollowers, orgFollowers)
 		info("Wrote %d org followers → %s", len(orgFollowers), fnFollowers)
-
 		writeLines(fnKeywordUsers, keywordUsers)
 		info("Wrote %d keyword-matched users → %s", len(keywordUsers), fnKeywordUsers)
-
 		writeLines(fnLikelyAssociated, likelyAssociated)
 		info("Wrote %d likely associated users → %s", len(likelyAssociated), fnLikelyAssociated)
 	}
-
 	if *scanFofM || *scanFofF {
 		writeLines(fnSecondaryKeywordUsers, secondaryKeywordUsers)
 		info("Wrote %d secondary keyword-matched users → %s", len(secondaryKeywordUsers), fnSecondaryKeywordUsers)
@@ -425,21 +504,16 @@ func main() {
 }
 
 // ── Terminal report ───────────────────────────────────────────────────────────
-
 func printReport(orgs []string, orgMap map[string]*OrgData) {
 	header("Full Report")
 	for _, org := range orgs {
 		d := orgMap[org]
 		fmt.Printf("\n%s%s%s %s[%s]%s\n", colorBold, colorCyan, org, colorBlue, "organization", colorReset)
-
 		fmt.Printf("  %s%-22s%s (%d)\n", colorBold, "Repositories", colorReset, len(d.Repos))
 		for _, r := range d.Repos { bullet("%s", r) }
-
 		fmt.Printf("  %s%-22s%s (%d)\n", colorBold, "Members", colorReset, len(d.Members))
 		for _, u := range d.Members { bullet("%s", u) }
-
 		fmt.Printf("  %s%-22s%s (%d — see org_followers.txt)\n", colorBold, "Followers", colorReset, len(d.Followers))
-
 		if len(d.CommitUsers) > 0 {
 			fmt.Printf("  %s%-22s%s (%d — see likely_associated_users.txt)\n", colorBold, "Commit Users", colorReset, len(d.CommitUsers))
 		}
@@ -449,23 +523,19 @@ func printReport(orgs []string, orgMap map[string]*OrgData) {
 		if len(d.IssueUsers) > 0 {
 			fmt.Printf("  %s%-22s%s (%d — see likely_associated_users.txt)\n", colorBold, "Issue Users", colorReset, len(d.IssueUsers))
 		}
-
 		fmt.Printf("  %s%-22s%s (%d)\n", colorBold, "Keyword Users", colorReset, len(d.KeywordUsers))
 		for _, u := range d.KeywordUsers { bullet("%s%s%s", colorGreen, u, colorReset) }
 	}
 }
 
 // ── YAML metadata writer ──────────────────────────────────────────────────────
-
 func writeUserMeta(path string, orgs []string, orgMap map[string]*OrgData) {
 	f, err := os.Create(path)
 	fatalIf("creating "+path, err)
 	defer f.Close()
-
 	w := bufio.NewWriter(f)
 	fmt.Fprintln(w, "# User source metadata")
 	fmt.Fprintln(w, "# Organised by organization, then by category")
-
 	for _, org := range orgs {
 		d := orgMap[org]
 		fmt.Fprintf(w, "\n%s:\n", org)
@@ -476,7 +546,6 @@ func writeUserMeta(path string, orgs []string, orgMap map[string]*OrgData) {
 		writeYAMLCategoryWithURL(w, "issues", d.IssueUsers)
 		writeYAMLCategory(w, "keyword_matches", d.KeywordUsers)
 	}
-
 	fatalIf("flushing "+path, w.Flush())
 }
 
@@ -497,28 +566,29 @@ func writeYAMLCategoryWithURL(w *bufio.Writer, category string, entries []UserEn
 	fmt.Fprintf(w, "  %s:\n", category)
 	for _, e := range sorted {
 		fmt.Fprintf(w, "    - login: %q\n", e.Login)
-		if e.URL != "" {
-			fmt.Fprintf(w, "      url: %q\n", e.URL)
-		}
+		if e.URL != "" { fmt.Fprintf(w, "      url: %q\n", e.URL) }
 	}
 }
 
 // ── Rate limit helpers ────────────────────────────────────────────────────────
-
+// checkRateLimit warns when remaining requests are low. If the hourly limit is
+// fully exhausted (5,000 req/hour with PAT), it sleeps until the reset time
+// then resumes — no hard stops.
 func checkRateLimit(resp *github.Response, label string) bool {
 	if resp == nil { return false }
 	rl := resp.Rate
 	if rl.Remaining == 0 {
-		fmt.Printf("\n%s%s⚠ RATE LIMIT REACHED%s — %s\n", colorBold, colorRed, colorReset, label)
-		fmt.Printf("  Limit    : %d\n", rl.Limit)
-		fmt.Printf("  Remaining: %s0%s\n", colorRed, colorReset)
-		fmt.Printf("  Resets at: %s\n\n", rl.Reset.Time.Local().Format("15:04:05 MST"))
-		return true
-	}
-	if rl.Remaining < 50 {
-		fmt.Printf("  %s⚠ Rate limit low%s — %d / %d remaining (resets %s)\n",
-			colorYellow, colorReset, rl.Remaining, rl.Limit,
-			rl.Reset.Time.Local().Format("15:04:05 MST"))
+		resetAt := rl.Reset.Time.Local()
+		waitDur := time.Until(resetAt) + 2*time.Second + 10
+		fmt.Printf("\n%s%s⚠ RATE LIMIT EXHAUSTED%s — %s\n", colorBold, colorRed, colorReset, label)
+		fmt.Printf("  Limit    : %d req/hour\n", rl.Limit)
+		fmt.Printf("  Resets at: %s\n", resetAt.Format("15:04:05 MST"))
+		if waitDur > 0 {
+			fmt.Printf("  Waiting  : %.0f seconds...\n\n", waitDur.Seconds())
+			time.Sleep(waitDur)
+			fmt.Printf("  %sResuming.%s\n", colorGreen, colorReset)
+		}
+		return false
 	}
 	return false
 }
@@ -543,7 +613,6 @@ func handleAPIErr(label string, err error, resp *github.Response) bool {
 }
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────
-
 func fetchOrgMembers(ctx context.Context, client *github.Client, org string, maxPages int) []string {
 	opts := &github.ListMembersOptions{
 		PublicOnly:  true,
@@ -595,7 +664,7 @@ func fetchFollowing(ctx context.Context, client *github.Client, user string, max
 	return names
 }
 
-func fetchOrgRepos(ctx context.Context, client *github.Client, org string, maxPages int) []string {
+func fetchOrgRepos(ctx context.Context, client *github.Client, org string, maxPages int, noForks bool) []string {
 	opts := &github.RepositoryListByOrgOptions{
 		Type:        "all",
 		ListOptions: github.ListOptions{PerPage: 100},
@@ -606,7 +675,10 @@ func fetchOrgRepos(ctx context.Context, client *github.Client, org string, maxPa
 		repos, resp, err := client.Repositories.ListByOrg(ctx, org, opts)
 		if handleAPIErr("ListByOrg:"+org, err, resp) { break }
 		checkRateLimit(resp, "ListByOrg:"+org)
-		for _, r := range repos { names = append(names, r.GetName()) }
+		for _, r := range repos {
+			if noForks && r.GetFork() { continue }
+			names = append(names, r.GetName())
+		}
 		page++
 		if resp.NextPage == 0 || (maxPages > 0 && page >= maxPages) { break }
 		opts.Page = resp.NextPage
@@ -710,7 +782,6 @@ func fetchProjectUsersV2(ctx context.Context, pat, org string, maxPages int, add
 		warn("Skipping Projects v2 scan — a PAT with 'read:project' scope is required (-t flag)")
 		return false
 	}
-
 	const query = `
 	query($org: String!, $projCursor: String, $itemCursor: String) {
 		organization(login: $org) {
@@ -741,7 +812,6 @@ func fetchProjectUsersV2(ctx context.Context, pat, org string, maxPages int, add
 			}
 		}
 	}`
-
 	type pageInfo    struct { HasNextPage bool `json:"hasNextPage"`; EndCursor string `json:"endCursor"` }
 	type userNode    struct { Login string `json:"login"` }
 	type userConn    struct { Nodes []userNode `json:"nodes"` }
@@ -795,7 +865,6 @@ func fetchProjectUsersV2(ctx context.Context, pat, org string, maxPages int, add
 	for {
 		result, err := doQuery(projCursor, "")
 		if err != nil { warn("Projects v2 GraphQL query failed for %s: %v", org, err); break }
-
 		projects := result.Data.Organization.ProjectsV2
 		if len(projects.Nodes) > 0 && !found {
 			found = true
@@ -876,14 +945,12 @@ func matchesKeywords(ctx context.Context, client *github.Client, login string, k
 	if handleAPIErr("Users.Get:"+login, err, resp) { return false }
 	if u == nil { return false }
 	checkRateLimit(resp, "Users.Get:"+login)
-
 	normalize := func(s string) string {
 		s = strings.ToLower(s)
 		s = strings.ReplaceAll(s, " ", "")
 		s = strings.ReplaceAll(s, ".", "")
 		return s
 	}
-
 	fields := []string{
 		normalize(u.GetType()),
 		normalize(u.GetName()),
@@ -893,15 +960,12 @@ func matchesKeywords(ctx context.Context, client *github.Client, login string, k
 		normalize(u.GetEmail()),
 		normalize(u.GetBio()),
 	}
-
-	// Fetch and decode profile README (repo named same as username)
 	readme, _, readmeErr := client.Repositories.GetReadme(ctx, login, login, nil)
 	if readmeErr == nil && readme != nil {
 		if content, err := readme.GetContent(); err == nil && content != "" {
 			fields = append(fields, normalize(content))
 		}
 	}
-
 	for _, kw := range keywords {
 		kw = normalize(strings.TrimSpace(kw))
 		if kw == "" { continue }
@@ -919,7 +983,6 @@ func matchesKeywords(ctx context.Context, client *github.Client, login string, k
 }
 
 // ── File I/O helpers ──────────────────────────────────────────────────────────
-
 func readLines(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil { return nil, err }
@@ -947,7 +1010,6 @@ func writeLines(path string, lines []string) {
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
-
 func dedupe(s []string) []string {
 	seen := make(map[string]bool, len(s))
 	out  := make([]string, 0, len(s))
